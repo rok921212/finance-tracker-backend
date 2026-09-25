@@ -9,3 +9,14 @@ services:
     envVars:
       - key: PORT
         value: "10000" # Render injects PORT environment variable automatically but you can specify default
+      - key: NODE_ENV
+        value: production
+      # Set these as secrets in the Render dashboard:
+      # MONGO_URI, JWT_SECRET, REGISTER_CODE, FRONTEND_ORIGINS,
+      # CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET,
+      # ADMIN_USERNAME, ADMIN_PASSWORD (only needed when running `npm run seed`)
+      # Redis cache (REDIS_URL or UPSTASH_REDIS_REST_URL/_TOKEN): set the eviction policy to
+      # `volatile-lru`, so memory pressure only evicts cached bodies (they have a TTL) and never the
+      # version counters (no TTL). /api/health reports cache hits, misses and Redis fallbacks.
+      # After deploys that change indexes or drop fields, run `npm run seed` once (Render shell):
+      # it syncs indexes (drops ones no longer defined) and removes unused stored fields.

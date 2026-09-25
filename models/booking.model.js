@@ -14,48 +14,37 @@ const bookingDataSchema = new mongoose.Schema(
     bookings: [
       {
         customerName: {
-          type: String,
-          required: [false],
+          type: String,
         },
         date: {
-          type: String,
-          required: [false],
+          type: String,
         },
         time: {
-          type: String,
-          required: [false],
+          type: String,
         },
         server: {
-          type: String,
-          required: [false],
+          type: String,
         },
         entryFee: {
-          type: Number,
-          required: [false],
+          type: Number,
         },
         winning: {
-          type: Number,
-          required: [false],
+          type: Number,
         },
         discription: {
-          type: String,
-          required: [false],
+          type: String,
         },
         caster: {
-          type: String,
-          required: [false],
+          type: String,
         },
         casterCost: {
-          type: Number,
-          required: [false],
+          type: Number,
         },
         production: {
-          type: String,
-          required: [false],
+          type: String,
         },
         productionCost: {
-          type: Number,
-          required: [false],
+          type: Number,
         },
         paid: {
           type: Boolean,
@@ -66,6 +55,9 @@ const bookingDataSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// Every booking query is scoped by userId
+bookingDataSchema.index({ userId: 1 });
 
 const bookingData = mongoose.model("bookingData", bookingDataSchema);
 
