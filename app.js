@@ -43,11 +43,17 @@ app.use(
     filter: (req, res) => !String(res.getHeader("Content-Type") || "").startsWith("text/event-stream") && compression.filter(req, res),
   })
 );
+const blockedOrigins = new Set();
 app.use(
   cors({
     origin: (origin, cb) => {
       // Allow non-browser clients (no Origin header) and configured frontends
-      if (!origin || env.FRONTEND_ORIGINS.includes(origin)) return cb(null, true);
+      if (!origin || env.FRONTEND_ORIGINS.includes(origin.toLowerCase())) return cb(null, true);
+      // Logged once per origin: shows exactly what to add to FRONTEND_ORIGINS
+      if (!blockedOrigins.has(origin)) {
+        blockedOrigins.add(origin);
+        console.warn(`[cors] blocked origin ${origin} (not in FRONTEND_ORIGINS)`);
+      }
       cb(null, false);
     },
     // Let the browser read ETags and data versions (kept until a pushed bump moves them), and

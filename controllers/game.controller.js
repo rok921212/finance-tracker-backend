@@ -25,13 +25,13 @@ const cleanName = (name) => {
   return n;
 };
 
-const toAdminGame = (g, used = 0) => ({
+const toAdminGame = (g, points) => ({
   id: g._id,
   name: g.name,
   slug: g.slug,
   active: g.active,
   sortOrder: g.sortOrder,
-  ...withPoints(g, used),
+  ...withPoints(g, points),
 });
 
 // Empty/null = unlimited; otherwise an amount like "1000" or "250.50" (stored in cents)

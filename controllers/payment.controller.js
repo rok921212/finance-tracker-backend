@@ -93,8 +93,9 @@ const assertGameActive = async (gameId) => {
 const assertPointsLeft = async (gameId, loaded, excludeId) => {
   const game = await Game.findById(gameId).select("name totalPoints").lean();
   if (!game || game.totalPoints == null) return;
-  const used = (await pointsUsed([gameId], excludeId)).get(String(gameId)) || 0;
-  const remaining = game.totalPoints - used;
+  const { used = 0, redeemed = 0 } = (await pointsUsed([gameId], excludeId)).get(String(gameId)) || {};
+  // Redeemed points go back into the game's pool
+  const remaining = game.totalPoints - used + redeemed;
   if (loaded > remaining) {
     const left = (Math.max(0, remaining) / 100).toFixed(2);
     throw new HttpError(400, `Not enough points left for ${game.name} (${left} remaining)`, "INSUFFICIENT_GAME_POINTS", {

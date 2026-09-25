@@ -14,6 +14,7 @@ router.get("/summary", asyncHandler(admin.summary));
 
 router.get("/payments", asyncHandler(admin.listPayments));
 router.get("/payments/export.csv", asyncHandler(admin.exportCsv));
+router.get("/payments/export.pdf", asyncHandler(admin.exportPdf));
 router.get("/payments/changes", asyncHandler(admin.paymentChanges));
 router.get("/payments/:id", asyncHandler(admin.getPayment));
 router.delete("/payments/:id", asyncHandler(admin.deletePayment));

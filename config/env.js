@@ -16,7 +16,8 @@ const env = {
   CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET,
   FRONTEND_ORIGINS: (process.env.FRONTEND_ORIGINS || (isProd ? "" : "http://localhost:3001,http://localhost:3000"))
     .split(",")
-    .map((o) => o.trim())
+    // Browsers send the origin without a trailing slash; tolerate "https://x.vercel.app/" and case slips
+    .map((o) => o.trim().replace(/\/+$/, "").toLowerCase())
     .filter(Boolean),
   // Optional cache backends (see services/cache.js); falls back to in-memory
   REDIS_URL: process.env.REDIS_URL,

@@ -178,7 +178,7 @@ describe("payment creation", () => {
     expect((await submit(userA.token, { ...base, paymentMethod: "bitcoin" }, avif(702))).body.code).toBe("INVALID_PAYMENT_METHOD");
     expect((await submit(userA.token, { ...base, player: null }, avif(703))).body.code).toBe("PLAYER_REQUIRED");
     expect((await submit(userA.token, { ...base, player: "x".repeat(61) }, avif(704))).body.code).toBe("INVALID_PLAYER");
-    for (const m of ["cashapp", "venmo", "paypal", "zelle", "applepay"]) {
+    for (const m of ["cashapp", "venmo", "paypal", "zelle", "applepay", "chime"]) {
       const ok = await submit(userA.token, { ...base, paymentMethod: m, player: "  Lucky77 " }, avif(710 + m.length));
       expect(ok.status).toBe(201);
       const doc = await Payment.findById(ok.body.payment.id).lean();
@@ -414,6 +414,37 @@ describe("admin", () => {
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain("bob");
     expect(lines[1]).toContain("700.00");
+  });
+
+  test("payment method and player filters narrow the list and exports; PDF export works", async () => {
+    const res = await submit(userA.token, { date: "2026-09-19", deposit: "12", loaded: "12", paymentMethod: "chime", player: "Zed Chimer", gameId: fireKirin._id }, avif(9401));
+    expect(res.status).toBe(201);
+
+    const byMethod = await request(app).get("/api/admin/payments?paymentMethod=chime").set(auth(adminTok));
+    expect(byMethod.body.items.length).toBeGreaterThan(0);
+    expect(byMethod.body.items.every((i) => i.paymentMethod === "chime")).toBe(true);
+    const byPlayer = await request(app).get("/api/admin/payments?player=zed%20chi").set(auth(adminTok));
+    expect(byPlayer.body.items.map((i) => i.player)).toEqual(["Zed Chimer"]);
+    expect((await request(app).get("/api/admin/payments?paymentMethod=bitcoin").set(auth(adminTok))).status).toBe(400);
+
+    const csv = await request(app).get("/api/admin/payments/export.csv?player=Zed").set(auth(adminTok));
+    expect(csv.text.trim().split("\n")).toHaveLength(2);
+
+    const pdf = await request(app)
+      .get("/api/admin/payments/export.pdf?paymentMethod=chime")
+      .set(auth(adminTok))
+      .buffer(true)
+      .parse((r, cb) => {
+        const chunks = [];
+        r.on("data", (c) => chunks.push(c));
+        r.on("end", () => cb(null, Buffer.concat(chunks)));
+      });
+    expect(pdf.status).toBe(200);
+    expect(pdf.headers["content-type"]).toContain("application/pdf");
+    expect(pdf.body.subarray(0, 4).toString()).toBe("%PDF");
+    expect((await request(app).get("/api/admin/payments/export.pdf").set(auth(userA.token))).status).toBe(403);
+
+    await request(app).delete(`/api/admin/payments/${res.body.payment.id}`).set(auth(adminTok));
   });
 });
 
@@ -1001,6 +1032,24 @@ describe("game points pool", () => {
     // Blank = unlimited again
     const clear = await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "" });
     expect(clear.body).toMatchObject({ totalPoints: null, remaining: null });
+  });
+
+  test("redeemed points go back into the game's pool and are reported separately", async () => {
+    await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "100" });
+    const ok = await submit(userA.token, { date: "2026-09-18", deposit: "50", loaded: "50", redeemed: "20", gameId: game._id }, avif(9111));
+    expect(ok.status).toBe(201);
+    expect(await pointsOf()).toMatchObject({ totalPoints: 10000, used: 5000, redeemed: 2000, remaining: 7000 });
+    const games = await request(app).get("/api/games").set(auth(userA.token));
+    expect(games.body.find((g) => g.id === String(game._id))).toMatchObject({ remaining: 7000 });
+
+    // The returned points can be loaded again
+    const more = await submit(userA.token, { date: "2026-09-18", deposit: "70", loaded: "70", gameId: game._id }, avif(9112));
+    expect(more.status).toBe(201);
+    expect(await pointsOf()).toMatchObject({ used: 12000, redeemed: 2000, remaining: 0 });
+
+    await request(app).delete(`/api/admin/payments/${ok.body.payment.id}`).set(auth(adminTok));
+    await request(app).delete(`/api/admin/payments/${more.body.payment.id}`).set(auth(adminTok));
+    await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "" });
   });
 });
 

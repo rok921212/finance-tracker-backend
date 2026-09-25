@@ -7,7 +7,7 @@ const cents = {
   validate: { validator: Number.isSafeInteger, message: "Amount must be an integer number of cents" },
 };
 
-const PAYMENT_METHODS = ["cashapp", "venmo", "paypal", "zelle", "applepay"];
+const PAYMENT_METHODS = ["cashapp", "venmo", "paypal", "zelle", "applepay", "chime"];
 
 const paymentSchema = new mongoose.Schema(
   {

@@ -47,7 +47,7 @@ const LOCK_WAIT_MS = 1500; // others wait this long for its result, then compute
 const LOCK_POLL_MS = 100;
 // Part of every cache key: bump when any cached response changes shape or meaning (or the stored
 // format changes), so a deploy never serves bodies written by older code (even from a shared Redis).
-const CACHE_SCHEMA = 7;
+const CACHE_SCHEMA = 8;
 
 // A missing counter starts from the current time: always above any value it could have had before
 const seed = () => Date.now();

@@ -11,6 +11,8 @@ const { toListItem, gameLookup, cleanupAssets } = require("./payment.controller.
 const DeletedPayment = require("../models/deletedPayment.model.js");
 const PaymentEdit = require("../models/paymentEdit.model.js");
 const BookingData = require("../models/booking.model.js");
+const Game = require("../models/game.model.js");
+const PDFDocument = require("pdfkit");
 const { sendCached, bump, deps } = require("../services/cache.js");
 const { listProject, syncToken, sendChanges } = require("../utils/delta.js");
 
@@ -428,6 +430,128 @@ const exportCsv = async (req, res) => {
   res.end();
 };
 
+const METHOD_LABELS = { cashapp: "Cash App", venmo: "Venmo", paypal: "PayPal", zelle: "Zelle", applepay: "Apple Pay", chime: "Chime" };
+const paymentMethodLabel = (m) => METHOD_LABELS[m] || "";
+
+const PDF_COLUMNS = [
+  { label: "Date", width: 62 },
+  { label: "User", width: 100 },
+  { label: "Player", width: 110 },
+  { label: "Method", width: 70 },
+  { label: "Game", width: 130 },
+  { label: "Deposit", width: 70, right: true },
+  { label: "Loaded", width: 70, right: true },
+  { label: "Redeemed", width: 70, right: true },
+  { label: "Cashout", width: 70, right: true },
+];
+
+// Human-readable list of the active filters, printed at the top of the PDF
+const describeFilters = async (q) => {
+  const parts = [];
+  if (q.dateFrom || q.dateTo) parts.push(`Date: ${q.dateFrom || "start"} to ${q.dateTo || "today"}`);
+  if (q.userId) {
+    const u = await User.findById(q.userId).select("username").lean();
+    parts.push(`User: ${u ? u.username : q.userId}`);
+  } else if (q.search) parts.push(`User: ${q.search}*`);
+  if (q.player) parts.push(`Player: ${q.player}*`);
+  if (q.paymentMethod) parts.push(`Payment: ${paymentMethodLabel(q.paymentMethod)}`);
+  if (q.gameId) {
+    const g = await Game.findById(q.gameId).select("name").lean();
+    parts.push(`Game: ${g ? g.name : q.gameId}`);
+  }
+  return parts.length ? parts.join("   |   ") : "None (all entries)";
+};
+
+// Streams a PDF table of the currently filtered payments (same filters as the list and CSV)
+const exportPdf = async (req, res) => {
+  const match = await buildPaymentFilter(req.query);
+  const filtersLine = await describeFilters(req.query);
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="payments-${stamp}.pdf"`);
+
+  const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 30 });
+  doc.pipe(res);
+  const left = doc.page.margins.left;
+  const bottom = () => doc.page.height - doc.page.margins.bottom;
+  const ROW_H = 16;
+  let y;
+
+  const drawRow = (cells, { bold = false, fill = null } = {}) => {
+    if (fill) doc.rect(left, y - 3, PDF_COLUMNS.reduce((s, c) => s + c.width, 0), ROW_H).fill(fill);
+    doc.fillColor("#000").font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(8);
+    let x = left;
+    PDF_COLUMNS.forEach((c, i) => {
+      doc.text(String(cells[i] ?? ""), x + 3, y, { width: c.width - 6, align: c.right ? "right" : "left", lineBreak: false, ellipsis: true, height: ROW_H });
+      x += c.width;
+    });
+    y += ROW_H;
+  };
+  const header = () => {
+    drawRow(PDF_COLUMNS.map((c) => c.label), { bold: true, fill: "#e5e7eb" });
+  };
+  const ensureRoom = () => {
+    if (y + ROW_H > bottom()) {
+      doc.addPage();
+      y = doc.page.margins.top;
+      header();
+    }
+  };
+
+  doc.font("Helvetica-Bold").fontSize(16).text("Payments Report", left, doc.page.margins.top);
+  doc.font("Helvetica").fontSize(9).fillColor("#444").text(`Generated: ${new Date().toISOString().replace("T", " ").slice(0, 16)} UTC`);
+  doc.text(`Filters: ${filtersLine}`);
+  doc.moveDown(0.8);
+  y = doc.y;
+  header();
+
+  const totals = { count: 0, deposit: 0, loaded: 0, redeemed: 0, cashout: 0 };
+  const cursor = Payment.aggregate([
+    { $match: match },
+    { $sort: { date: -1, _id: -1 } },
+    ...gameLookup,
+    ...userLookup,
+  ]).cursor({ batchSize: 500 });
+  for await (const p of cursor) {
+    ensureRoom();
+    totals.count += 1;
+    totals.deposit += p.deposit;
+    totals.loaded += p.loaded;
+    totals.redeemed += p.redeemed || 0;
+    totals.cashout += p.cashout || 0;
+    drawRow(
+      [
+        p.date.toISOString().slice(0, 10),
+        p.user ? p.user.username : "",
+        p.player || "",
+        paymentMethodLabel(p.paymentMethod),
+        p.game ? p.game.name : "",
+        centsToString(p.deposit),
+        centsToString(p.loaded),
+        centsToString(p.redeemed || 0),
+        centsToString(p.cashout || 0),
+      ],
+      { fill: totals.count % 2 === 0 ? "#f9fafb" : null }
+    );
+  }
+  ensureRoom();
+  drawRow(
+    [
+      "Total",
+      `${totals.count} entries`,
+      "",
+      "",
+      "",
+      centsToString(totals.deposit),
+      centsToString(totals.loaded),
+      centsToString(totals.redeemed),
+      centsToString(totals.cashout),
+    ],
+    { bold: true, fill: "#e5e7eb" }
+  );
+  doc.end();
+};
+
 // Users' edits to their entries (what changed, when), newest first; filter by user and/or entry
 const listEdits = async (req, res) => {
   const match = {};
@@ -522,5 +646,6 @@ module.exports = {
   deleteUser,
   gamesSummary,
   exportCsv,
+  exportPdf,
   listAudit,
 };
