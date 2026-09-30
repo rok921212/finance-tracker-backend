@@ -1,21 +1,15 @@
 const Game = require("../models/game.model.js");
 const AuditLog = require("../models/auditLog.model.js");
 const { HttpError } = require("../utils/httpError.js");
-const { toObjectId, parseToCents } = require("../utils/validation.js");
+const { toObjectId } = require("../utils/validation.js");
 const { sendCached, bump, deps } = require("../services/cache.js");
-const { pointsUsed, withPoints } = require("../utils/gamePoints.js");
 
 // Public (authenticated) list used by the Add Entry dropdown: active games only
-// Cached in Redis until a game or payment changes (points left move with payments);
-// the browser always revalidates (a cheap 304 via ETag)
+// Cached in Redis until a game changes; the browser always revalidates (a cheap 304 via ETag)
 const listActiveGames = async (req, res) => {
-  await sendCached(req, res, { name: "games", deps: [deps.games, deps.payments] }, async () => {
-    const games = await Game.find({ active: true }).sort({ sortOrder: 1, name: 1 }).select("name totalPoints").lean();
-    const used = await pointsUsed(games.map((g) => g._id));
-    return games.map((g) => {
-      const { totalPoints, remaining } = withPoints(g, used.get(String(g._id)));
-      return { id: g._id, name: g.name, totalPoints, remaining };
-    });
+  await sendCached(req, res, { name: "games", deps: [deps.games] }, async () => {
+    const games = await Game.find({ active: true }).sort({ sortOrder: 1, name: 1 }).select("name").lean();
+    return games.map((g) => ({ id: g._id, name: g.name }));
   });
 };
 
@@ -25,26 +19,18 @@ const cleanName = (name) => {
   return n;
 };
 
-const toAdminGame = (g, points) => ({
+const toAdminGame = (g) => ({
   id: g._id,
   name: g.name,
   slug: g.slug,
   active: g.active,
   sortOrder: g.sortOrder,
-  ...withPoints(g, points),
 });
 
-// Empty/null = unlimited; otherwise an amount like "1000" or "250.50" (stored in cents)
-const cleanTotalPoints = (value) => {
-  if (value === null || String(value).trim() === "") return null;
-  return parseToCents(value, "Total points");
-};
-
 const adminListGames = async (req, res) => {
-  await sendCached(req, res, { name: "admin-games", deps: [deps.games, deps.payments] }, async () => {
-    const games = await Game.find().sort({ sortOrder: 1, name: 1 }).select("name slug active sortOrder totalPoints").lean();
-    const used = await pointsUsed(games.map((g) => g._id));
-    return games.map((g) => toAdminGame(g, used.get(String(g._id))));
+  await sendCached(req, res, { name: "admin-games", deps: [deps.games] }, async () => {
+    const games = await Game.find().sort({ sortOrder: 1, name: 1 }).select("name slug active sortOrder").lean();
+    return games.map(toAdminGame);
   });
 };
 
@@ -79,13 +65,6 @@ const updateGame = async (req, res) => {
     if (!Number.isInteger(order)) throw new HttpError(400, "sortOrder must be an integer", "INVALID_ORDER");
     game.sortOrder = order;
   }
-  if (req.body.totalPoints !== undefined) {
-    const totalPoints = cleanTotalPoints(req.body.totalPoints);
-    if (totalPoints !== (game.totalPoints ?? null)) {
-      changes.totalPoints = { from: game.totalPoints ?? null, to: totalPoints };
-      game.totalPoints = totalPoints;
-    }
-  }
   let toggled = false;
   if (req.body.active !== undefined) {
     const active = Boolean(req.body.active);
@@ -98,9 +77,8 @@ const updateGame = async (req, res) => {
   if (modified) await bump(deps.games);
 
   if (toggled) await AuditLog.record(req.userId, "game.toggle", "game", game._id, { active: game.active });
-  if (changes.name || changes.totalPoints) await AuditLog.record(req.userId, "game.update", "game", game._id, changes);
-  const used = await pointsUsed([game._id]);
-  res.json(toAdminGame(game, used.get(String(game._id))));
+  if (changes.name) await AuditLog.record(req.userId, "game.update", "game", game._id, changes);
+  res.json(toAdminGame(game));
 };
 
 // Swap sortOrder with the neighbour in the requested direction

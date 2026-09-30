@@ -17,6 +17,10 @@ const paymentSchema = new mongoose.Schema(
     paymentMethod: { type: String, enum: PAYMENT_METHODS },
     // Name the player used to load points
     player: { type: String, trim: true, maxlength: 60 },
+    // Game-backend username/identifier the points were loaded from (required for new entries)
+    gameUsername: { type: String, trim: true, maxlength: 60 },
+    // Tag of the account the money was sent to, e.g. a $cashtag (required for new entries)
+    paymentTag: { type: String, trim: true, maxlength: 60 },
     // Calendar day, stored as UTC midnight
     date: { type: Date, required: true },
     // Money is stored as integer minor units (cents) to avoid floating point errors
