@@ -8,7 +8,6 @@ const { HttpError } = require("../utils/httpError.js");
 const { parseToCents, parseDay, toObjectId, parsePagination, pageResult, escapeRegex } = require("../utils/validation.js");
 const { sendCached, bump, deps } = require("../services/cache.js");
 const { listProject, syncToken, sendChanges } = require("../utils/delta.js");
-const { pointsUsed } = require("../utils/gamePoints.js");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -24,10 +23,15 @@ const toListItem = (p, thumbSize = 160) => ({
   cashout: p.cashout || 0,
   paymentMethod: p.paymentMethod || null,
   player: p.player || null,
+  gameUsername: p.gameUsername || null,
+  paymentTag: p.paymentTag || null,
   editedAt: p.editedAt || undefined,
   userDeletedAt: p.userDeletedAt || undefined,
   thumb: cloud.thumbUrl(p.screenshot, thumbSize),
   cashoutThumb: cloud.thumbUrl(p.cashoutProof, thumbSize),
+  // Full-size URLs too, so opening a screenshot needs no extra API round trip
+  shot: cloud.fullUrl(p.screenshot),
+  cashoutShot: cloud.fullUrl(p.cashoutProof),
   ...(p.user ? { user: { id: p.user._id, username: p.user.username } } : {}),
 });
 
@@ -50,6 +54,16 @@ const cleanPlayer = (value) => {
   if (player.length > 60) throw new HttpError(400, "Player must be at most 60 characters", "INVALID_PLAYER");
   return player;
 };
+
+// Required short text (max 60): the game-backend username and the payment tag
+const requiredText = (label, code) => (value) => {
+  const text = String(value ?? "").trim();
+  if (!text) throw new HttpError(400, `${label} is required`, `${code}_REQUIRED`);
+  if (text.length > 60) throw new HttpError(400, `${label} must be at most 60 characters`, `INVALID_${code}`);
+  return text;
+};
+const cleanGameUsername = requiredText("Backend username", "GAME_USERNAME");
+const cleanPaymentTag = requiredText("Payment tag", "PAYMENT_TAG");
 
 const cleanPaymentMethod = (value) => {
   const method = String(value ?? "").trim().toLowerCase();
@@ -79,29 +93,47 @@ const parseEntry = (body) => {
     cashout: cashoutRaw ? parseToCents(cashoutRaw, "Cashout") : 0,
     paymentMethod: cleanPaymentMethod(body.paymentMethod),
     player: cleanPlayer(body.player),
-    gameId: toObjectId(body.gameId, "game"),
+    gameUsername: cleanGameUsername(body.gameUsername),
+    paymentTag: cleanPaymentTag(body.paymentTag),
   };
 };
 
+// Games are picked from the admin-managed list: new entries (and switching an entry to another game)
+// need an active game; an entry may keep a game that was disabled later.
 const assertGameActive = async (gameId) => {
   const game = await Game.findOne({ _id: gameId, active: true }).select("_id").lean();
   if (!game) throw new HttpError(400, "Game unavailable", "GAME_UNAVAILABLE");
 };
 
-// The entry's "loaded" must fit in what's left of the game's points pool (if one is set).
-// excludeId: the entry being edited, so its old amount isn't counted twice.
-const assertPointsLeft = async (gameId, loaded, excludeId) => {
-  const game = await Game.findById(gameId).select("name totalPoints").lean();
-  if (!game || game.totalPoints == null) return;
-  const { used = 0, redeemed = 0 } = (await pointsUsed([gameId], excludeId)).get(String(gameId)) || {};
-  // Redeemed points go back into the game's pool
-  const remaining = game.totalPoints - used + redeemed;
-  if (loaded > remaining) {
-    const left = (Math.max(0, remaining) / 100).toFixed(2);
-    throw new HttpError(400, `Not enough points left for ${game.name} (${left} remaining)`, "INSUFFICIENT_GAME_POINTS", {
-      remaining: Math.max(0, remaining),
-    });
+// A custom game name (the "Custom game" option) maps to one Game record by name, ignoring case and
+// spacing. A new name is created disabled: it is tracked in the admin Games tab (loaded / redeemed)
+// but only offered in everyone's dropdown once an admin enables it.
+const findOrCreateCustomGame = async (raw) => {
+  const name = String(raw).trim().replace(/\s+/g, " ");
+  if (name.length > 60) throw new HttpError(400, "Game name must be at most 60 characters", "INVALID_GAME");
+  const slug = Game.slugify(name);
+  if (!slug) throw new HttpError(400, "Game name must contain letters or numbers", "INVALID_GAME");
+  const existing = await Game.findOne({ slug }).select("_id").lean();
+  if (existing) return existing._id;
+  try {
+    const last = await Game.findOne().sort({ sortOrder: -1 }).select("sortOrder").lean();
+    const game = await Game.create({ name, slug, active: false, sortOrder: last ? last.sortOrder + 1 : 0 });
+    await bump(deps.games);
+    return game._id;
+  } catch (err) {
+    // Two entries created the same new game at once: use the one that won
+    if (err && err.code === 11000) return (await Game.findOne({ slug }).select("_id").lean())._id;
+    throw err;
   }
+};
+
+// The entry's game: a custom name, or a picked gameId (which must be active unless it is the
+// game the entry already has)
+const resolveGame = async (body, currentGameId = null) => {
+  if (String(body.customGame ?? "").trim()) return findOrCreateCustomGame(body.customGame);
+  const gameId = toObjectId(body.gameId, "game");
+  if (!currentGameId || !currentGameId.equals(gameId)) await assertGameActive(gameId);
+  return gameId;
 };
 
 const hashOf = (buffer) => crypto.createHash("sha256").update(buffer).digest("hex");
@@ -170,8 +202,7 @@ const createPayment = async (req, res) => {
   const userId = toObjectId(req.userId, "user");
   const entry = parseEntry(req.body);
   const cashoutFile = req.cashoutProofFile; // optional
-  await assertGameActive(entry.gameId);
-  await assertPointsLeft(entry.gameId, entry.loaded);
+  entry.gameId = await resolveGame(req.body);
 
   // The payment screenshot is optional
   const hash = req.file ? hashOf(req.file.buffer) : null;
@@ -228,6 +259,8 @@ const diffEntry = async (current, entry) => {
     changes.push({ field: "game", from: nameOf(current.gameId), to: nameOf(entry.gameId) });
   }
   compare("player", current.player || null, entry.player);
+  compare("gameUsername", current.gameUsername || null, entry.gameUsername);
+  compare("paymentTag", current.paymentTag || null, entry.paymentTag);
   compare("paymentMethod", current.paymentMethod || null, entry.paymentMethod);
   compare("deposit", current.deposit, entry.deposit);
   compare("loaded", current.loaded, entry.loaded);
@@ -242,15 +275,12 @@ const updatePayment = async (req, res) => {
   const userId = toObjectId(req.userId, "user");
   const id = toObjectId(req.params.id, "payment id");
   const current = await Payment.findOne({ _id: id, userId, userDeletedAt: null })
-    .select("date gameId player paymentMethod deposit loaded redeemed cashout screenshot screenshotHash cashoutProof")
+    .select("date gameId player gameUsername paymentTag paymentMethod deposit loaded redeemed cashout screenshot screenshotHash cashoutProof")
     .lean();
   if (!current) throw new HttpError(404, "Payment not found", "NOT_FOUND");
 
   const entry = parseEntry(req.body);
-  // Keeping a game that has since been disabled is fine; switching to one is not
-  if (!current.gameId.equals(entry.gameId)) await assertGameActive(entry.gameId);
-  // Checked on every edit: "loaded" may have changed even when the game didn't
-  await assertPointsLeft(entry.gameId, entry.loaded, id);
+  entry.gameId = await resolveGame(req.body, current.gameId);
   const cashoutFile = req.cashoutProofFile; // optional: omitted keeps the current one
 
   const newHash = req.file ? hashOf(req.file.buffer) : null;

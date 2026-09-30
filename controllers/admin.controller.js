@@ -396,54 +396,62 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
+const METHOD_LABELS = { cashapp: "Cash App", venmo: "Venmo", paypal: "PayPal", zelle: "Zelle", applepay: "Apple Pay", chime: "Chime" };
+const paymentMethodLabel = (m) => METHOD_LABELS[m] || "";
+
+const day = (d) => d.toISOString().slice(0, 10);
+const iso = (d) => (d ? d.toISOString() : "");
+
+// Every column the exports can include. The admin picks a subset with ?columns=date,player,...
+// (none = all). `money` columns are summed into the PDF total row; `pdf: false` columns are CSV-only.
+// csv/pdf give the cell for each format when they differ; widths are relative (scaled to the page).
+const EXPORT_COLUMNS = [
+  { key: "id", label: "Payment ID", pdf: false, value: (p) => p._id },
+  { key: "date", label: "Date", width: 62, value: (p) => day(p.date) },
+  { key: "user", label: "User", width: 90, value: (p) => (p.user ? p.user.username : "") },
+  { key: "player", label: "Player", width: 95, value: (p) => p.player || "" },
+  { key: "game", label: "Game", width: 105, value: (p) => (p.game ? p.game.name : "") },
+  { key: "gameUsername", label: "Backend Username", width: 95, value: (p) => p.gameUsername || "" },
+  { key: "paymentMethod", label: "Payment Method", width: 70, csv: (p) => p.paymentMethod || "", value: (p) => paymentMethodLabel(p.paymentMethod) },
+  { key: "paymentTag", label: "Payment Tag", width: 90, value: (p) => p.paymentTag || "" },
+  { key: "deposit", label: "Deposit", width: 70, money: true, value: (p) => p.deposit },
+  { key: "loaded", label: "Loaded", width: 70, money: true, value: (p) => p.loaded },
+  { key: "redeemed", label: "Redeemed", width: 70, money: true, value: (p) => p.redeemed || 0 },
+  { key: "cashout", label: "Cashout", width: 70, money: true, value: (p) => p.cashout || 0 },
+  { key: "createdAt", label: "Created At", pdf: false, value: (p) => iso(p.createdAt) },
+  { key: "editedAt", label: "Edited At", pdf: false, value: (p) => iso(p.editedAt) },
+];
+
+// ?columns=a,b,c -> those columns in the standard order; unknown keys are ignored, none/empty = all
+const pickColumns = (raw) => {
+  const wanted = new Set(String(raw ?? "").split(",").map((k) => k.trim()).filter(Boolean));
+  const picked = EXPORT_COLUMNS.filter((c) => wanted.has(c.key));
+  return picked.length ? picked : EXPORT_COLUMNS;
+};
+
+const cellOf = (c, p, format) => {
+  const v = format === "csv" && c.csv ? c.csv(p) : c.value(p);
+  return c.money ? centsToString(v) : v;
+};
+
+const exportCursor = (match) =>
+  Payment.aggregate([{ $match: match }, { $sort: { date: -1, _id: -1 } }, ...gameLookup, ...userLookup]).cursor({ batchSize: 500 });
+
 // Streams CSV for the currently filtered payments; never buffers the full result set
 const exportCsv = async (req, res) => {
   const match = await buildPaymentFilter(req.query);
+  const columns = pickColumns(req.query.columns);
   const stamp = new Date().toISOString().slice(0, 10);
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="payments-${stamp}.csv"`);
-  res.write("Payment ID,Date,User,Player,Payment Method,Game,Deposit,Loaded,Redeemed,Cashout,Created At,Edited At\n");
+  res.write(columns.map((c) => csvCell(c.label)).join(",") + "\n");
 
-  const cursor = Payment.aggregate([
-    { $match: match },
-    { $sort: { date: -1, _id: -1 } },
-    ...gameLookup,
-    ...userLookup,
-  ]).cursor({ batchSize: 500 });
-  for await (const p of cursor) {
-    const row = [
-      p._id,
-      p.date.toISOString().slice(0, 10),
-      p.user ? p.user.username : "",
-      p.player || "",
-      p.paymentMethod || "",
-      p.game ? p.game.name : "",
-      centsToString(p.deposit),
-      centsToString(p.loaded),
-      centsToString(p.redeemed || 0),
-      centsToString(p.cashout || 0),
-      p.createdAt ? p.createdAt.toISOString() : "",
-      p.editedAt ? p.editedAt.toISOString() : "",
-    ].map(csvCell);
+  for await (const p of exportCursor(match)) {
+    const row = columns.map((c) => csvCell(cellOf(c, p, "csv")));
     if (!res.write(row.join(",") + "\n")) await new Promise((r) => res.once("drain", r));
   }
   res.end();
 };
-
-const METHOD_LABELS = { cashapp: "Cash App", venmo: "Venmo", paypal: "PayPal", zelle: "Zelle", applepay: "Apple Pay", chime: "Chime" };
-const paymentMethodLabel = (m) => METHOD_LABELS[m] || "";
-
-const PDF_COLUMNS = [
-  { label: "Date", width: 62 },
-  { label: "User", width: 100 },
-  { label: "Player", width: 110 },
-  { label: "Method", width: 70 },
-  { label: "Game", width: 130 },
-  { label: "Deposit", width: 70, right: true },
-  { label: "Loaded", width: 70, right: true },
-  { label: "Redeemed", width: 70, right: true },
-  { label: "Cashout", width: 70, right: true },
-];
 
 // Human-readable list of the active filters, printed at the top of the PDF
 const describeFilters = async (q) => {
@@ -466,6 +474,8 @@ const describeFilters = async (q) => {
 const exportPdf = async (req, res) => {
   const match = await buildPaymentFilter(req.query);
   const filtersLine = await describeFilters(req.query);
+  let columns = pickColumns(req.query.columns).filter((c) => c.pdf !== false);
+  if (!columns.length) columns = EXPORT_COLUMNS.filter((c) => c.pdf !== false);
   const stamp = new Date().toISOString().slice(0, 10);
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", `attachment; filename="payments-${stamp}.pdf"`);
@@ -474,21 +484,25 @@ const exportPdf = async (req, res) => {
   doc.pipe(res);
   const left = doc.page.margins.left;
   const bottom = () => doc.page.height - doc.page.margins.bottom;
+  // Scale the picked columns to fill the page width, whichever subset was chosen
+  const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const scale = pageWidth / columns.reduce((s, c) => s + c.width, 0);
+  const widths = columns.map((c) => c.width * scale);
   const ROW_H = 16;
   let y;
 
   const drawRow = (cells, { bold = false, fill = null } = {}) => {
-    if (fill) doc.rect(left, y - 3, PDF_COLUMNS.reduce((s, c) => s + c.width, 0), ROW_H).fill(fill);
+    if (fill) doc.rect(left, y - 3, pageWidth, ROW_H).fill(fill);
     doc.fillColor("#000").font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(8);
     let x = left;
-    PDF_COLUMNS.forEach((c, i) => {
-      doc.text(String(cells[i] ?? ""), x + 3, y, { width: c.width - 6, align: c.right ? "right" : "left", lineBreak: false, ellipsis: true, height: ROW_H });
-      x += c.width;
+    columns.forEach((c, i) => {
+      doc.text(String(cells[i] ?? ""), x + 3, y, { width: widths[i] - 6, align: c.money ? "right" : "left", lineBreak: false, ellipsis: true, height: ROW_H });
+      x += widths[i];
     });
     y += ROW_H;
   };
   const header = () => {
-    drawRow(PDF_COLUMNS.map((c) => c.label), { bold: true, fill: "#e5e7eb" });
+    drawRow(columns.map((c) => c.label), { bold: true, fill: "#e5e7eb" });
   };
   const ensureRoom = () => {
     if (y + ROW_H > bottom()) {
@@ -505,50 +519,24 @@ const exportPdf = async (req, res) => {
   y = doc.y;
   header();
 
-  const totals = { count: 0, deposit: 0, loaded: 0, redeemed: 0, cashout: 0 };
-  const cursor = Payment.aggregate([
-    { $match: match },
-    { $sort: { date: -1, _id: -1 } },
-    ...gameLookup,
-    ...userLookup,
-  ]).cursor({ batchSize: 500 });
-  for await (const p of cursor) {
+  let count = 0;
+  const totals = Object.fromEntries(columns.filter((c) => c.money).map((c) => [c.key, 0]));
+  for await (const p of exportCursor(match)) {
     ensureRoom();
-    totals.count += 1;
-    totals.deposit += p.deposit;
-    totals.loaded += p.loaded;
-    totals.redeemed += p.redeemed || 0;
-    totals.cashout += p.cashout || 0;
+    count += 1;
+    columns.forEach((c) => {
+      if (c.money) totals[c.key] += c.value(p);
+    });
     drawRow(
-      [
-        p.date.toISOString().slice(0, 10),
-        p.user ? p.user.username : "",
-        p.player || "",
-        paymentMethodLabel(p.paymentMethod),
-        p.game ? p.game.name : "",
-        centsToString(p.deposit),
-        centsToString(p.loaded),
-        centsToString(p.redeemed || 0),
-        centsToString(p.cashout || 0),
-      ],
-      { fill: totals.count % 2 === 0 ? "#f9fafb" : null }
+      columns.map((c) => cellOf(c, p, "pdf")),
+      { fill: count % 2 === 0 ? "#f9fafb" : null }
     );
   }
   ensureRoom();
-  drawRow(
-    [
-      "Total",
-      `${totals.count} entries`,
-      "",
-      "",
-      "",
-      centsToString(totals.deposit),
-      centsToString(totals.loaded),
-      centsToString(totals.redeemed),
-      centsToString(totals.cashout),
-    ],
-    { bold: true, fill: "#e5e7eb" }
-  );
+  // Total row: "Total" and the entry count in the first text columns, sums under the money columns
+  const labels = ["Total", `${count} entries`];
+  const totalRow = columns.map((c) => (c.money ? centsToString(totals[c.key]) : labels.shift() || ""));
+  drawRow(totalRow, { bold: true, fill: "#e5e7eb" });
   doc.end();
 };
 

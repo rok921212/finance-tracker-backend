@@ -58,7 +58,7 @@ const auth = (tok) => ({ Authorization: `Bearer ${tok}` });
 // Required fields get defaults unless a test passes them (null = omit the field)
 const submit = (tok, fields, file = avif(), name = "shot.avif", cashoutProof = null) => {
   const req = request(app).post("/api/payments").set(auth(tok));
-  Object.entries({ redeemed: "0", paymentMethod: "cashapp", player: "Player One", ...fields }).forEach(([k, v]) => v !== null && req.field(k, String(v)));
+  Object.entries({ redeemed: "0", paymentMethod: "cashapp", player: "Player One", gameUsername: "agent01", paymentTag: "$payme", ...fields }).forEach(([k, v]) => v !== null && req.field(k, String(v)));
   if (file) req.attach("screenshot", file, name);
   if (cashoutProof) req.attach("cashoutProof", cashoutProof, "cashout.png");
   return req;
@@ -134,7 +134,7 @@ describe("payment creation", () => {
     expect(p.redeemed).toBe(12025);
     expect(p.screenshot.publicId).toBe(`payments/${p.screenshotHash}`);
     expect(Object.keys(p).sort()).toEqual(
-      ["_id", "createdAt", "date", "deposit", "gameId", "loaded", "redeemed", "cashout", "paymentMethod", "player", "screenshot", "screenshotHash", "updatedAt", "userId"].sort()
+      ["_id", "createdAt", "date", "deposit", "gameId", "loaded", "redeemed", "cashout", "paymentMethod", "player", "gameUsername", "paymentTag", "screenshot", "screenshotHash", "updatedAt", "userId"].sort()
     );
   });
 
@@ -162,14 +162,37 @@ describe("payment creation", () => {
     await Payment.deleteMany({ _id: { $in: [a.body.payment.id, b.body.payment.id] } });
   });
 
-  test("rejects disabled game, bad amounts, bad dates", async () => {
+  test("rejects disabled or unknown game, bad amounts, bad dates", async () => {
     const base = { date: "2026-09-20", deposit: "10", loaded: "10", gameId: juwa._id };
     expect((await submit(userA.token, { ...base, gameId: disabledGame._id }, avif(1))).body.code).toBe("GAME_UNAVAILABLE");
+    expect((await submit(userA.token, { ...base, gameId: new mongoose.Types.ObjectId() }, avif(1))).body.code).toBe("GAME_UNAVAILABLE");
     expect((await submit(userA.token, { ...base, deposit: "-5" }, avif(2))).body.code).toBe("INVALID_AMOUNT");
     expect((await submit(userA.token, { ...base, deposit: "1.234" }, avif(3))).body.code).toBe("INVALID_AMOUNT");
     expect((await submit(userA.token, { ...base, redeemed: "-1" }, avif(3))).body.code).toBe("INVALID_AMOUNT");
     expect((await submit(userA.token, { ...base, date: "2026-02-31" }, avif(4))).body.code).toBe("INVALID_DATE");
     expect((await submit(userA.token, { ...base, date: "2099-01-01" }, avif(5))).body.code).toBe("INVALID_DATE");
+  });
+
+  test("a custom game name reuses a matching game or creates a disabled one", async () => {
+    const base = { date: "2026-09-17", deposit: "5", loaded: "5", gameId: null };
+    const same = await submit(userA.token, { ...base, customGame: "  fire   KIRIN " }, avif(731));
+    expect(same.status).toBe(201);
+    expect(String((await Payment.findById(same.body.payment.id).lean()).gameId)).toBe(String(fireKirin._id));
+
+    const fresh = await submit(userA.token, { ...base, customGame: "Milky Way" }, avif(732));
+    expect(fresh.status).toBe(201);
+    const created = await Game.findOne({ slug: "milky-way" }).lean();
+    // Tracked for the admin, but not offered in the dropdown until enabled
+    expect(created).toMatchObject({ name: "Milky Way", active: false });
+    const games = await request(app).get("/api/games").set(auth(userA.token));
+    expect(games.body.map((g) => g.name)).not.toContain("Milky Way");
+    const again = await submit(userA.token, { ...base, customGame: "milky way" }, avif(733));
+    expect(String((await Payment.findById(again.body.payment.id).lean()).gameId)).toBe(String(created._id));
+
+    expect((await submit(userA.token, { ...base, customGame: "!!!" }, avif(734))).body.code).toBe("INVALID_GAME");
+
+    await Payment.deleteMany({ _id: { $in: [same.body.payment.id, fresh.body.payment.id, again.body.payment.id] } });
+    await Game.deleteOne({ _id: created._id });
   });
 
   test("payment method and player are required and validated", async () => {
@@ -185,6 +208,27 @@ describe("payment creation", () => {
       expect(doc).toMatchObject({ paymentMethod: m, player: "Lucky77" });
       await Payment.deleteOne({ _id: doc._id });
     }
+  });
+
+  test("backend username and payment tag are required, trimmed and returned", async () => {
+    const base = { date: "2026-09-17", deposit: "5", loaded: "5", gameId: juwa._id };
+    expect((await submit(userA.token, { ...base, gameUsername: null }, avif(721))).body.code).toBe("GAME_USERNAME_REQUIRED");
+    expect((await submit(userA.token, { ...base, paymentTag: "  " }, avif(722))).body.code).toBe("PAYMENT_TAG_REQUIRED");
+    expect((await submit(userA.token, { ...base, paymentTag: "x".repeat(61) }, avif(723))).body.code).toBe("INVALID_PAYMENT_TAG");
+    const ok = await submit(userA.token, { ...base, gameUsername: " agent9 ", paymentTag: " $cash9 " }, avif(724));
+    expect(ok.status).toBe(201);
+    expect(await Payment.findById(ok.body.payment.id).lean()).toMatchObject({ gameUsername: "agent9", paymentTag: "$cash9" });
+    const detail = await request(app).get(`/api/admin/payments/${ok.body.payment.id}`).set(auth(adminTok));
+    expect(detail.body).toMatchObject({ gameUsername: "agent9", paymentTag: "$cash9" });
+    await Payment.deleteOne({ _id: ok.body.payment.id });
+  });
+
+  test("account owner no longer exists: a sent value is ignored", async () => {
+    const base = { date: "2026-09-17", deposit: "5", loaded: "5", gameId: juwa._id };
+    const ok = await submit(userA.token, { ...base, accountOwner: "olivia" }, avif(730));
+    expect(ok.status).toBe(201);
+    expect(await Payment.findById(ok.body.payment.id).lean()).not.toHaveProperty("accountOwner");
+    await Payment.deleteOne({ _id: ok.body.payment.id });
   });
 
   test("redeemed is required; 0 is allowed", async () => {
@@ -318,7 +362,7 @@ describe("user data isolation", () => {
     const res = await request(app).get("/api/payments?limit=500").set(auth(userA.token));
     expect(res.body.items.length).toBeLessThanOrEqual(50);
     const item = res.body.items[0];
-    expect(Object.keys(item).sort()).toEqual(["date", "deposit", "game", "id", "loaded", "redeemed", "cashout", "paymentMethod", "player", "thumb", "cashoutThumb"].sort());
+    expect(Object.keys(item).sort()).toEqual(["date", "deposit", "game", "id", "loaded", "redeemed", "cashout", "paymentMethod", "player", "gameUsername", "paymentTag", "thumb", "cashoutThumb", "shot", "cashoutShot"].sort());
   });
 });
 
@@ -427,8 +471,25 @@ describe("admin", () => {
     expect(byPlayer.body.items.map((i) => i.player)).toEqual(["Zed Chimer"]);
     expect((await request(app).get("/api/admin/payments?paymentMethod=bitcoin").set(auth(adminTok))).status).toBe(400);
 
+    const zoey = await submit(userA.token, { date: "2026-09-19", deposit: "7", loaded: "7", player: "Zoey Payer", gameId: fireKirin._id }, avif(9402));
+    expect(zoey.status).toBe(201);
+    const fullCsv = await request(app).get("/api/admin/payments/export.csv?player=Zoey").set(auth(adminTok));
+    expect(fullCsv.text.split("\n")[0]).toContain("Payment Method,Payment Tag,Deposit,");
+    expect(fullCsv.text).not.toContain("Account Owner");
+
     const csv = await request(app).get("/api/admin/payments/export.csv?player=Zed").set(auth(adminTok));
     expect(csv.text.trim().split("\n")).toHaveLength(2);
+
+    // Only the picked columns, in the standard order; unknown keys are ignored
+    const picked = await request(app)
+      .get("/api/admin/payments/export.csv?player=Zed&columns=paymentTag,date,bogus,gameUsername")
+      .set(auth(adminTok));
+    const [head, row] = picked.text.trim().split("\n");
+    expect(head).toBe("Date,Backend Username,Payment Tag");
+    expect(row).toBe("2026-09-19,agent01,$payme");
+    const pickedPdf = await request(app).get("/api/admin/payments/export.pdf?columns=player,gameUsername,paymentTag,deposit").set(auth(adminTok));
+    expect(pickedPdf.status).toBe(200);
+    expect(pickedPdf.headers["content-type"]).toContain("application/pdf");
 
     const pdf = await request(app)
       .get("/api/admin/payments/export.pdf?paymentMethod=chime")
@@ -599,7 +660,10 @@ describe("delta sync", () => {
       loaded: String(target.loaded / 100),
       redeemed: String((target.redeemed || 0) / 100),
       paymentMethod: target.paymentMethod,
+
       player: target.player,
+      gameUsername: target.gameUsername || "agent01",
+      paymentTag: target.paymentTag || "$payme",
       gameId: String(target.gameId),
     };
     Object.entries(fields).forEach(([k, v]) => edited.field(k, v));
@@ -758,7 +822,7 @@ describe("admin auth-code role endpoint", () => {
 
 describe("editing entries", () => {
   let base;
-  const makeBase = () => ({ date: "2026-09-16", deposit: "20", loaded: "18", redeemed: "10", paymentMethod: "venmo", player: "Ace", gameId: juwa._id });
+  const makeBase = () => ({ date: "2026-09-16", deposit: "20", loaded: "18", redeemed: "10", paymentMethod: "venmo", player: "Ace", gameUsername: "agentA", paymentTag: "$aceTag", gameId: juwa._id });
   const edit = (tok, id, fields, file = null, cashoutProof = null) => {
     const req = request(app).patch(`/api/payments/${id}`).set(auth(tok));
     Object.entries(fields).forEach(([k, v]) => v !== null && req.field(k, String(v)));
@@ -783,9 +847,9 @@ describe("editing entries", () => {
 
   test("updates fields and keeps the screenshot when none is sent", async () => {
     const before = await Payment.findById(id).lean();
-    const res = await edit(userA.token, id, { ...base, deposit: "25.50", paymentMethod: "zelle", player: "Ace2", gameId: fireKirin._id });
+    const res = await edit(userA.token, id, { ...base, deposit: "25.50", paymentMethod: "zelle", player: "Ace2", gameUsername: "agentB", gameId: fireKirin._id });
     expect(res.status).toBe(200);
-    expect(res.body.payment).toMatchObject({ deposit: 2550, paymentMethod: "zelle", player: "Ace2", game: "Fire Kirin" });
+    expect(res.body.payment).toMatchObject({ deposit: 2550, paymentMethod: "zelle", player: "Ace2", gameUsername: "agentB", paymentTag: "$aceTag", game: "Fire Kirin" });
     expect(res.body.payment.editedAt).toBeDefined();
     expect(res.body.payment).not.toHaveProperty("status");
 
@@ -795,6 +859,7 @@ describe("editing entries", () => {
     expect(log.changes).toEqual([
       { field: "game", from: "Juwa", to: "Fire Kirin" },
       { field: "player", from: "Ace", to: "Ace2" },
+      { field: "gameUsername", from: "agentA", to: "agentB" },
       { field: "paymentMethod", from: "venmo", to: "zelle" },
       { field: "deposit", from: 2000, to: 2550 },
     ]);
@@ -986,70 +1051,27 @@ describe("cashout totals", () => {
   });
 });
 
-describe("game points pool", () => {
+describe("games have no points limit", () => {
   let game;
-  const pointsOf = async () => {
-    const res = await request(app).get("/api/admin/games").set(auth(adminTok));
-    return res.body.find((g) => g.id === String(game._id));
-  };
-
   beforeAll(async () => {
-    game = await Game.create({ name: "Ultra Panda", slug: "ultra-panda", sortOrder: 9 });
+    const created = await request(app).post("/api/admin/games").set(auth(adminTok)).send({ name: "Ultra Panda" });
+    game = { _id: created.body.id };
+    // A pool left over from before the limit was removed
+    await Game.updateOne({ _id: game._id }, { $set: { totalPoints: 100 } });
   });
 
-  test("admin sets total points; loaded entries use them up; edits and deletes give them back", async () => {
-    expect(await pointsOf()).toMatchObject({ totalPoints: null, used: 0, remaining: null });
-
-    const set = await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "100" });
-    expect(set.status).toBe(200);
-    expect(set.body).toMatchObject({ totalPoints: 10000, used: 0, remaining: 10000 });
-    expect((await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "-5" })).status).toBe(400);
-
-    const base = { date: "2026-09-18", deposit: "60", gameId: game._id };
-    const ok = await submit(userA.token, { ...base, loaded: "60" }, avif(9101));
+  test("a leftover points pool is ignored and games expose only id and name", async () => {
+    const ok = await submit(userA.token, { date: "2026-09-18", deposit: "500", loaded: "500", gameId: game._id }, avif(9101));
     expect(ok.status).toBe(201);
-    expect(await pointsOf()).toMatchObject({ used: 6000, remaining: 4000 });
 
-    // Users see the pool too
     const games = await request(app).get("/api/games").set(auth(userA.token));
-    expect(games.body.find((g) => g.id === String(game._id))).toMatchObject({ totalPoints: 10000, remaining: 4000 });
+    const g = games.body.find((x) => x.id === String(game._id));
+    expect(Object.keys(g).sort()).toEqual(["id", "name"]);
 
-    const over = await submit(userA.token, { ...base, loaded: "40.01" }, avif(9102));
-    expect(over.status).toBe(400);
-    expect(over.body.code).toBe("INSUFFICIENT_GAME_POINTS");
-
-    // Editing "loaded" down gives points back; the entry's own old amount isn't counted twice
-    const lower = request(app).patch(`/api/payments/${ok.body.payment.id}`).set(auth(userA.token));
-    Object.entries({ ...base, loaded: "25", redeemed: "0", paymentMethod: "cashapp", player: "Player One" }).forEach(([k, v]) =>
-      lower.field(k, String(v))
-    );
-    expect((await lower).status).toBe(200);
-    expect(await pointsOf()).toMatchObject({ used: 2500, remaining: 7500 });
+    const admin = await request(app).get("/api/admin/games").set(auth(adminTok));
+    expect(admin.body.find((x) => x.id === String(game._id))).not.toHaveProperty("totalPoints");
 
     await request(app).delete(`/api/admin/payments/${ok.body.payment.id}`).set(auth(adminTok));
-    expect(await pointsOf()).toMatchObject({ used: 0, remaining: 10000 });
-
-    // Blank = unlimited again
-    const clear = await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "" });
-    expect(clear.body).toMatchObject({ totalPoints: null, remaining: null });
-  });
-
-  test("redeemed points go back into the game's pool and are reported separately", async () => {
-    await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "100" });
-    const ok = await submit(userA.token, { date: "2026-09-18", deposit: "50", loaded: "50", redeemed: "20", gameId: game._id }, avif(9111));
-    expect(ok.status).toBe(201);
-    expect(await pointsOf()).toMatchObject({ totalPoints: 10000, used: 5000, redeemed: 2000, remaining: 7000 });
-    const games = await request(app).get("/api/games").set(auth(userA.token));
-    expect(games.body.find((g) => g.id === String(game._id))).toMatchObject({ remaining: 7000 });
-
-    // The returned points can be loaded again
-    const more = await submit(userA.token, { date: "2026-09-18", deposit: "70", loaded: "70", gameId: game._id }, avif(9112));
-    expect(more.status).toBe(201);
-    expect(await pointsOf()).toMatchObject({ used: 12000, redeemed: 2000, remaining: 0 });
-
-    await request(app).delete(`/api/admin/payments/${ok.body.payment.id}`).set(auth(adminTok));
-    await request(app).delete(`/api/admin/payments/${more.body.payment.id}`).set(auth(adminTok));
-    await request(app).patch(`/api/admin/games/${game._id}`).set(auth(adminTok)).send({ totalPoints: "" });
   });
 });
 
@@ -1217,7 +1239,7 @@ describe("live data-version events", () => {
 
   test("responses carry the data versions they reflect; writes report the new ones", async () => {
     const games = await request(app).get("/api/games").set(auth(userA.token));
-    expect(games.headers["x-cache-versions"]).toMatch(/^games=\d+,payments=\d+$/);
+    expect(games.headers["x-cache-versions"]).toMatch(/^games=\d+$/);
 
     const team = await request(app).post("/api/bookingData").set(auth(userA.token)).send({ teamName: "Versioned", bookings: [] });
     expect(team.headers["x-data-versions"]).toMatch(new RegExp(`^bookings:u:${userA.id}=[0-9]+$`));
@@ -1297,14 +1319,11 @@ describe("admin user management: edit, password reset, delete", () => {
     expect(self.body.code).toBe("SELF_DELETE");
   });
 
-  test("deleting a user removes their entries, ends their session and returns game points", async () => {
-    const game = await Game.create({ name: "Delete Test", slug: "delete-test", sortOrder: 20, totalPoints: 100000 });
+  test("deleting a user removes their entries and ends their session", async () => {
+    const game = await Game.create({ name: "Delete Test", slug: "delete-test", sortOrder: 20 });
     const gina = await register("gina");
     const sub = await submit(gina.token, { date: "2026-09-18", deposit: "70", loaded: "70", gameId: game._id }, avif(9301));
     expect(sub.status).toBe(201);
-    const usedOf = async () =>
-      (await request(app).get("/api/admin/games").set(auth(adminTok))).body.find((g) => g.id === String(game._id)).used;
-    expect(await usedOf()).toBe(7000);
 
     const del = await request(app).delete(`/api/admin/users/${gina.id}`).set(auth(adminTok));
     expect(del.status).toBe(200);
@@ -1313,7 +1332,6 @@ describe("admin user management: edit, password reset, delete", () => {
     expect(await User.exists({ _id: gina.id })).toBeNull();
     expect(await Payment.countDocuments({ userId: gina.id })).toBe(0);
     expect(await DeletedPayment.countDocuments({ userId: gina.id })).toBe(1);
-    expect(await usedOf()).toBe(0);
     expect((await request(app).get("/api/payments/summary").set(auth(gina.token))).status).toBe(401);
     expect(await AuditLog.countDocuments({ action: "user.delete", targetId: gina.id })).toBe(1);
     expect((await request(app).delete(`/api/admin/users/${gina.id}`).set(auth(adminTok))).status).toBe(404);
