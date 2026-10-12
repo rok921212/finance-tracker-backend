@@ -141,29 +141,33 @@ const spinWheel = async (req, res) => {
   const won = segments[index];
 
   await WheelSpin.create({ segmentId: won._id, label: won.label, amount: amountText(won.amount), forced, ipHash: hash });
+  await bump(deps.wheelSpins);
   res.json({ ...toPublicSegment(won), segmentId: won._id, index, spinDurationSec: config.spinDurationSec });
 };
 
 // ---------- Admin ----------
 
+// Cached until the wheel changes or someone spins (both are pushed to open admin tabs)
 const adminGetWheel = async (req, res) => {
-  const [config, segments, spins] = await Promise.all([
-    readConfig(),
-    WheelSegment.find().sort({ sortOrder: 1, createdAt: 1 }).lean(),
-    WheelSpin.find().sort({ createdAt: -1 }).limit(RECENT_SPINS).lean(),
-  ]);
-  res.json({
-    config,
-    segments: segments.map(toAdminSegment),
-    recentSpins: spins.map((s) => ({
-      id: s._id,
-      segmentId: s.segmentId,
-      label: s.label,
-      amount: amountText(s.amount),
-      forced: s.forced,
-      createdAt: s.createdAt,
-    })),
-    limits: { minSegments: MIN_SEGMENTS, maxSegments: MAX_SEGMENTS },
+  await sendCached(req, res, { name: "admin-wheel", deps: [deps.wheel, deps.wheelSpins] }, async () => {
+    const [config, segments, spins] = await Promise.all([
+      readConfig(),
+      WheelSegment.find().sort({ sortOrder: 1, createdAt: 1 }).lean(),
+      WheelSpin.find().sort({ createdAt: -1 }).limit(RECENT_SPINS).lean(),
+    ]);
+    return {
+      config,
+      segments: segments.map(toAdminSegment),
+      recentSpins: spins.map((s) => ({
+        id: s._id,
+        segmentId: s.segmentId,
+        label: s.label,
+        amount: amountText(s.amount),
+        forced: s.forced,
+        createdAt: s.createdAt,
+      })),
+      limits: { minSegments: MIN_SEGMENTS, maxSegments: MAX_SEGMENTS },
+    };
   });
 };
 

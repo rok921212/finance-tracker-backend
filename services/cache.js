@@ -491,6 +491,8 @@ const deps = {
   banner: "banner",
   tags: "tags",
   wheel: "wheel",
+  // Bumped by every public spin; only the admin wheel view (recent spins) depends on it
+  wheelSpins: "wheel-spins",
   payments: "payments",
   userPayments: (userId) => `payments:u:${userId}`,
   users: "users",

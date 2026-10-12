@@ -315,6 +315,19 @@ describe("wheel of fortune", () => {
     expect(pub.body.segments.map((s) => s.label)).toEqual(["Try again", "10 Free Plays"]);
   });
 
+  test("the admin wheel view is cached until the wheel changes or someone spins", async () => {
+    const first = await request(app).get("/api/admin/wheel").set(auth(adminTok));
+    expect(first.headers.etag).toBeTruthy();
+    expect(first.headers["x-cache-versions"]).toMatch(/wheel-spins=/);
+    const same = await request(app).get("/api/admin/wheel").set(auth(adminTok)).set("If-None-Match", first.headers.etag);
+    expect(same.status).toBe(304);
+
+    expect((await spin()).status).toBe(200);
+    const after = await request(app).get("/api/admin/wheel").set(auth(adminTok)).set("If-None-Match", first.headers.etag);
+    expect(after.status).toBe(200);
+    expect(after.body.recentSpins.length).toBe(first.body.recentSpins.length + 1);
+  });
+
   test("wheel admin routes reject non-admins", async () => {
     expect((await createSegment({ label: "nope" }, null, userA.token)).status).toBe(403);
     expect((await request(app).get("/api/admin/wheel")).status).toBe(401);
@@ -1480,6 +1493,15 @@ describe("live data-version events", () => {
     expect(me.body.user.username).toBe("alice");
     const again = await request(app).get("/api/auth/me").set(auth(userA.token)).set("If-None-Match", me.headers.etag);
     expect(again.status).toBe(304);
+  });
+
+  test("every user follows the public-page data (tags, banner, wheel)", async () => {
+    const s = await stream(userA.token, ["tags", "wheel", "banner"]);
+    const hello = await s.next((e) => e.event === "hello");
+    ["tags", "wheel", "banner"].forEach((d) => expect(hello.data).toHaveProperty(d));
+    await request(app).put("/api/admin/wheel/config").set(auth(adminTok)).send({ subtitle: "live" });
+    await s.next((e) => e.event === "bump" && e.data.wheel);
+    s.close();
   });
 
   test("a role change is pushed to that account", async () => {

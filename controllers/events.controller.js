@@ -7,10 +7,11 @@ const HEARTBEAT_MS = 25000;
 const MAX_DEPS = 200;
 const CROSS_INSTANCE_POLL_MS = 3000;
 
-// Deps every user may follow: the games list (its points-remaining depends on all payments)
-const USER_GLOBAL = [deps.games, deps.payments];
+// Deps every user may follow: the games list (its points-remaining depends on all payments) and
+// the data behind the public pages (/play, /tags, /wheel), which anyone can read anyway
+const USER_GLOBAL = [deps.games, deps.payments, deps.tags, deps.banner, deps.wheel];
 // What an admin follows even before caching anything
-const ADMIN_GLOBAL = [deps.games, deps.payments, deps.users, deps.audit];
+const ADMIN_GLOBAL = [deps.games, deps.payments, deps.users, deps.audit, deps.tags, deps.banner, deps.wheel];
 
 const streams = new Set();
 
