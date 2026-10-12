@@ -15,6 +15,7 @@ jest.mock("../services/cloudinary.js", () => {
     uploadGameImage: jest.fn(async (buffer, hash) => ({ publicId: `payments/games/${hash}`, version: 1, existing: false })),
     uploadBanner: jest.fn(async (buffer, hash) => ({ publicId: `payments/banners/${hash}`, version: 1, existing: false })),
     uploadTagQr: jest.fn(async (buffer, hash) => ({ publicId: `payments/tags/${hash}`, version: 1, existing: false })),
+    uploadWheelImage: jest.fn(async (buffer, hash) => ({ publicId: `payments/wheel/${hash}`, version: 1, existing: false })),
     destroy: jest.fn(async () => ({ result: "ok" })),
   };
 });
@@ -225,6 +226,99 @@ describe("payment tags", () => {
   test("tag admin routes reject non-admins", async () => {
     expect((await createTag({ method: "cashapp", handle: "$nope" }, null, userA.token)).status).toBe(403);
     expect((await request(app).get("/api/admin/tags")).status).toBe(401);
+  });
+});
+
+describe("wheel of fortune", () => {
+  const createSegment = (fields, image = null, tok = adminTok) => {
+    const req = request(app).post("/api/admin/wheel/segments").set(auth(tok));
+    Object.entries(fields).forEach(([k, v]) => req.field(k, String(v)));
+    if (image) req.attach("image", image, "prize.png");
+    return req;
+  };
+  const config = (body) => request(app).put("/api/admin/wheel/config").set(auth(adminTok)).send(body);
+  const spin = () => request(app).post("/api/public/wheel/spin");
+  let segs;
+
+  test("admins build segments; invalid input is rejected", async () => {
+    const a = await createSegment({ label: "10 Free Plays", amount: "$10", color: "#FF0000" }, png());
+    expect(a.status).toBe(201);
+    expect(a.body.color).toBe("#ff0000");
+    expect(a.body.imageUrl).toContain("payments/wheel/");
+    const b = await createSegment({ label: "Jackpot", amount: "5000 coins" });
+    const c = await createSegment({ label: "Try again" });
+    segs = [a.body, b.body, c.body];
+    expect(b.body.imageUrl).toBeNull();
+
+    expect((await createSegment({ label: " " })).body.code).toBe("INVALID_LABEL");
+    expect((await createSegment({ label: "x", amount: "x".repeat(31) })).body.code).toBe("INVALID_AMOUNT");
+    expect(c.body.amount).toBe("");
+    expect((await createSegment({ label: "x", color: "red" })).body.code).toBe("INVALID_COLOR");
+  });
+
+  test("the wheel is closed until enabled", async () => {
+    expect((await request(app).get("/api/public/wheel")).body.enabled).toBe(false);
+    const res = await spin();
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("WHEEL_CLOSED");
+  });
+
+  test("the public view hides the target and spins land on it", async () => {
+    expect((await config({ targetSegmentId: "000000000000000000000000" })).body.code).toBe("INVALID_TARGET");
+    const saved = await config({ enabled: true, spinDurationSec: 8, targetSegmentId: segs[1].id });
+    expect(saved.status).toBe(200);
+    expect(saved.body.spinDurationSec).toBe(8);
+    expect((await config({ spinDurationSec: 99 })).body.code).toBe("INVALID_WHEEL_SETTING");
+
+    const pub = await request(app).get("/api/public/wheel");
+    expect(pub.body.enabled).toBe(true);
+    expect(pub.body.segments.map((s) => s.label)).toEqual(["10 Free Plays", "Jackpot", "Try again"]);
+    expect(JSON.stringify(pub.body)).not.toContain("targetSegmentId");
+
+    for (let i = 0; i < 3; i++) {
+      const res = await spin();
+      expect(res.status).toBe(200);
+      expect(res.body.segmentId).toBe(segs[1].id);
+      expect(res.body.index).toBe(1);
+      expect(res.body.amount).toBe("5000 coins");
+    }
+    const admin = await request(app).get("/api/admin/wheel").set(auth(adminTok));
+    expect(admin.body.recentSpins.length).toBe(3);
+    expect(admin.body.recentSpins[0].forced).toBe(true);
+  });
+
+  test("an inactive target falls back to random; deleting it clears the target", async () => {
+    await request(app).patch(`/api/admin/wheel/segments/${segs[1].id}`).set(auth(adminTok)).send({ active: false });
+    const res = await spin();
+    expect(res.status).toBe(200);
+    expect([segs[0].id, segs[2].id]).toContain(res.body.segmentId);
+
+    await request(app).delete(`/api/admin/wheel/segments/${segs[1].id}`).set(auth(adminTok));
+    const admin = await request(app).get("/api/admin/wheel").set(auth(adminTok));
+    expect(admin.body.config.targetSegmentId).toBeNull();
+    expect(admin.body.segments.length).toBe(2);
+  });
+
+  test("cooldown blocks repeat spins from the same visitor", async () => {
+    await config({ cooldownSec: 60 });
+    const res = await spin();
+    expect(res.status).toBe(429);
+    expect(res.body.code).toBe("WHEEL_COOLDOWN");
+    expect(res.body.retryAfterSec).toBeGreaterThan(0);
+    await config({ cooldownSec: 0 });
+  });
+
+  test("segments reorder", async () => {
+    const moved = await request(app).post(`/api/admin/wheel/segments/${segs[2].id}/move`).set(auth(adminTok)).send({ direction: "up" });
+    expect(moved.body.changed.length).toBe(2);
+    const pub = await request(app).get("/api/public/wheel");
+    expect(pub.body.segments.map((s) => s.label)).toEqual(["Try again", "10 Free Plays"]);
+  });
+
+  test("wheel admin routes reject non-admins", async () => {
+    expect((await createSegment({ label: "nope" }, null, userA.token)).status).toBe(403);
+    expect((await request(app).get("/api/admin/wheel")).status).toBe(401);
+    expect((await request(app).put("/api/admin/wheel/config").set(auth(userA.token)).send({ enabled: false })).status).toBe(403);
   });
 });
 

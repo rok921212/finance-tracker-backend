@@ -490,6 +490,7 @@ const deps = {
   games: "games",
   banner: "banner",
   tags: "tags",
+  wheel: "wheel",
   payments: "payments",
   userPayments: (userId) => `payments:u:${userId}`,
   users: "users",

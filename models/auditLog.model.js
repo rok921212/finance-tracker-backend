@@ -7,9 +7,9 @@ const auditLogSchema = new mongoose.Schema(
     action: {
       type: String,
       required: true,
-      enum: ["payment.verify", "payment.reject", "payment.delete", "game.create", "game.update", "game.toggle", "game.image", "banner.update", "tag.create", "tag.update", "tag.delete","user.create", "user.role", "user.update", "user.delete"],
+      enum: ["payment.verify", "payment.reject", "payment.delete", "game.create", "game.update", "game.toggle", "game.image", "banner.update", "tag.create", "tag.update", "tag.delete", "wheel.config", "wheel.create", "wheel.update", "wheel.delete","user.create", "user.role", "user.update", "user.delete"],
     },
-    targetType: { type: String, enum: ["payment", "game", "user", "setting", "tag"], required: true },
+    targetType: { type: String, enum: ["payment", "game", "user", "setting", "tag", "wheel"], required: true },
     targetId: { type: mongoose.Schema.Types.ObjectId, required: true },
     metadata: { type: mongoose.Schema.Types.Mixed },
   },

@@ -122,6 +122,17 @@ const TAG_QR_MAX_WIDTH = 1000;
 const uploadTagQr = (buffer, hash) =>
   uploadTransformed(buffer, `${FOLDER}/tags/${hash}`, { width: TAG_QR_MAX_WIDTH, crop: "limit", quality: "auto" }, "QR code");
 
+const WHEEL_IMAGE_SIZE = 300;
+
+/** Wheel segment picture: square, shown small inside its slice. */
+const uploadWheelImage = (buffer, hash) =>
+  uploadTransformed(
+    buffer,
+    `${FOLDER}/wheel/${hash}`,
+    { width: WHEEL_IMAGE_SIZE, height: WHEEL_IMAGE_SIZE, crop: "fill", gravity: "auto", quality: "auto" },
+    "Wheel image"
+  );
+
 const destroy = (publicId) =>
   cloudinary.uploader.destroy(publicId, { resource_type: "image", invalidate: true });
 
@@ -144,6 +155,9 @@ const bannerUrl = (ref) => deliveryUrl(ref, { width: BANNER_MAX_WIDTH, crop: "li
 
 const tagQrUrl = (ref) => deliveryUrl(ref, { width: TAG_QR_MAX_WIDTH, crop: "limit", quality: "auto", fetch_format: "auto" });
 
+const wheelImageUrl = (ref) =>
+  deliveryUrl(ref, { width: WHEEL_IMAGE_SIZE, height: WHEEL_IMAGE_SIZE, crop: "fill", quality: "auto", fetch_format: "auto" });
+
 // Served as a file download (Content-Disposition: attachment); `<a download>` is ignored cross-origin
 const tagQrDownloadUrl = (ref, filename) =>
   ref && ref.publicId
@@ -161,6 +175,8 @@ module.exports = {
   uploadGameImage,
   uploadBanner,
   uploadTagQr,
+  uploadWheelImage,
+  wheelImageUrl,
   tagQrUrl,
   tagQrDownloadUrl,
   destroy,

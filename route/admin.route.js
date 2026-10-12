@@ -6,6 +6,7 @@ const admin = require("../controllers/admin.controller.js");
 const games = require("../controllers/game.controller.js");
 const banner = require("../controllers/banner.controller.js");
 const tags = require("../controllers/tag.controller.js");
+const wheel = require("../controllers/wheel.controller.js");
 const { uploadSingleImage } = require("../middleware/uploadImage.js");
 
 const router = express.Router();
@@ -49,6 +50,14 @@ router.post("/tags", optionalQr, asyncHandler(tags.createTag));
 router.patch("/tags/:id", optionalQr, asyncHandler(tags.updateTag));
 router.delete("/tags/:id", asyncHandler(tags.deleteTag));
 router.post("/tags/:id/move", asyncHandler(tags.moveTag));
+
+const optionalWheelImage = uploadSingleImage("image", { required: false });
+router.get("/wheel", asyncHandler(wheel.adminGetWheel));
+router.put("/wheel/config", asyncHandler(wheel.updateWheelConfig));
+router.post("/wheel/segments", optionalWheelImage, asyncHandler(wheel.createSegment));
+router.patch("/wheel/segments/:id", optionalWheelImage, asyncHandler(wheel.updateSegment));
+router.delete("/wheel/segments/:id", asyncHandler(wheel.deleteSegment));
+router.post("/wheel/segments/:id/move", asyncHandler(wheel.moveSegment));
 
 router.get("/audit", asyncHandler(admin.listAudit));
 
