@@ -7,7 +7,7 @@ const cloud = require("../services/cloudinary.js");
 const { HttpError } = require("../utils/httpError.js");
 const { toObjectId, escapeRegex, parsePagination, pageResult } = require("../utils/validation.js");
 const { buildPaymentFilter } = require("../utils/paymentFilters.js");
-const { toListItem, gameLookup, cleanupAssets } = require("./payment.controller.js");
+const { toListItem, gameLookup, cleanupAssets, summaryTotals } = require("./payment.controller.js");
 const DeletedPayment = require("../models/deletedPayment.model.js");
 const PaymentEdit = require("../models/paymentEdit.model.js");
 const BookingData = require("../models/booking.model.js");
@@ -52,12 +52,13 @@ const cleanTotals = (row) => {
 const summary = async (req, res) => {
   await sendCached(req, res, { name: "admin-summary", deps: [deps.payments, deps.users] }, async () => {
     const match = await buildPaymentFilter(req.query);
-    const [[row], totalUsers] = await Promise.all([
+    const [[row], breakdowns, totalUsers] = await Promise.all([
       Payment.aggregate([{ $match: match }, { $group: totalsGroup }]),
+      summaryTotals(match),
       // Every account created so far, admins included
       User.countDocuments(),
     ]);
-    return { ...cleanTotals(row), totalUsers };
+    return { ...cleanTotals(row), ...breakdowns, totalUsers };
   });
 };
 
@@ -418,6 +419,8 @@ const EXPORT_COLUMNS = [
   { key: "loaded", label: "Loaded", width: 70, money: true, value: (p) => p.loaded },
   { key: "redeemed", label: "Redeemed", width: 70, money: true, value: (p) => p.redeemed || 0 },
   { key: "cashout", label: "Cashout", width: 70, money: true, value: (p) => p.cashout || 0 },
+  { key: "cashoutMethod", label: "Cashout Method", width: 70, csv: (p) => p.cashoutMethod || "", value: (p) => paymentMethodLabel(p.cashoutMethod) },
+  { key: "notes", label: "Notes", pdf: false, value: (p) => p.notes || "" },
   { key: "createdAt", label: "Created At", pdf: false, value: (p) => iso(p.createdAt) },
   { key: "editedAt", label: "Edited At", pdf: false, value: (p) => iso(p.editedAt) },
 ];

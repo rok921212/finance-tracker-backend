@@ -12,6 +12,9 @@ jest.mock("../services/cloudinary.js", () => {
     ...actual,
     uploadScreenshot: jest.fn(async (buffer, hash) => ({ publicId: `payments/${hash}`, version: 1, existing: false })),
     uploadCashoutProof: jest.fn(async (buffer, hash) => ({ publicId: `payments/cashout/${hash}`, version: 1, existing: false })),
+    uploadGameImage: jest.fn(async (buffer, hash) => ({ publicId: `payments/games/${hash}`, version: 1, existing: false })),
+    uploadBanner: jest.fn(async (buffer, hash) => ({ publicId: `payments/banners/${hash}`, version: 1, existing: false })),
+    uploadTagQr: jest.fn(async (buffer, hash) => ({ publicId: `payments/tags/${hash}`, version: 1, existing: false })),
     destroy: jest.fn(async () => ({ result: "ok" })),
   };
 });
@@ -121,6 +124,107 @@ describe("games", () => {
   test("only active games are listed", async () => {
     const res = await request(app).get("/api/games").set(auth(userA.token));
     expect(res.body.map((g) => g.name)).toEqual(["Juwa", "Fire Kirin"]);
+  });
+});
+
+describe("public games page", () => {
+  test("lists active games with no login, and admins can set a game image", async () => {
+    const before = await request(app).get("/api/public/games");
+    expect(before.status).toBe(200);
+    expect(before.body.map((g) => g.name)).toEqual(["Juwa", "Fire Kirin"]);
+    expect(before.body[0].imageUrl).toBeNull();
+
+    const up = await request(app).post(`/api/admin/games/${juwa._id}/image`).set(auth(adminTok)).attach("image", png(), "tile.png");
+    expect(up.status).toBe(200);
+    expect(up.body.imageUrl).toContain("payments/games/");
+    expect(up.body.imageUrl).toMatch(/w_600/);
+
+    const after = await request(app).get("/api/public/games");
+    expect(after.body[0].imageUrl).toBe(up.body.imageUrl);
+
+    const bad = await request(app).post(`/api/admin/games/${juwa._id}/image`).set(auth(adminTok)).attach("image", Buffer.from("plain text, not an image"), "x.png");
+    expect(bad.body.code).toBe("UNSUPPORTED_TYPE");
+
+    const removed = await request(app).delete(`/api/admin/games/${juwa._id}/image`).set(auth(adminTok));
+    expect(removed.body.imageUrl).toBeNull();
+  });
+
+  test("popup banner: hidden until uploaded, can be disabled and removed", async () => {
+    expect((await request(app).get("/api/public/banner")).body).toBeNull();
+
+    const up = await request(app).post("/api/admin/banner").set(auth(adminTok)).attach("image", png(), "banner.png");
+    expect(up.status).toBe(200);
+    expect(up.body.enabled).toBe(true);
+    expect((await request(app).get("/api/public/banner")).body.imageUrl).toContain("payments/banners/");
+
+    expect((await request(app).patch("/api/admin/banner").set(auth(adminTok)).send({ link: "javascript:alert(1)" })).body.code).toBe("INVALID_LINK");
+    const linked = await request(app).patch("/api/admin/banner").set(auth(adminTok)).send({ link: "https://example.com/promo" });
+    expect(linked.body.link).toBe("https://example.com/promo");
+    expect((await request(app).get("/api/public/banner")).body.link).toBe("https://example.com/promo");
+
+    await request(app).patch("/api/admin/banner").set(auth(adminTok)).send({ enabled: false });
+    expect((await request(app).get("/api/public/banner")).body).toBeNull();
+
+    await request(app).delete("/api/admin/banner").set(auth(adminTok));
+    expect((await request(app).get("/api/admin/banner").set(auth(adminTok))).body.imageUrl).toBeNull();
+  });
+
+  test("image and banner admin routes reject non-admins", async () => {
+    expect((await request(app).post(`/api/admin/games/${juwa._id}/image`).set(auth(userA.token)).attach("image", png(), "t.png")).status).toBe(403);
+    expect((await request(app).post("/api/admin/banner").attach("image", png(), "b.png")).status).toBe(401);
+  });
+});
+
+describe("payment tags", () => {
+  const createTag = (fields, qr = null, tok = adminTok) => {
+    const req = request(app).post("/api/admin/tags").set(auth(tok));
+    Object.entries(fields).forEach(([k, v]) => req.field(k, String(v)));
+    if (qr) req.attach("qr", qr, "qr.png");
+    return req;
+  };
+
+  test("admins create tags (QR optional); invalid methods and duplicates are rejected", async () => {
+    const cash = await createTag({ method: "cashapp", handle: " $payme ", name: "Main" }, png());
+    expect(cash.status).toBe(201);
+    expect(cash.body.handle).toBe("$payme");
+    expect(cash.body.qrUrl).toContain("payments/tags/");
+
+    const venmo = await createTag({ method: "venmo", handle: "@pay-venmo" });
+    expect(venmo.status).toBe(201);
+    expect(venmo.body.qrUrl).toBeNull();
+
+    expect((await createTag({ method: "bitcoin", handle: "x" })).body.code).toBe("INVALID_PAYMENT_METHOD");
+    expect((await createTag({ method: "cashapp", handle: "  " })).body.code).toBe("INVALID_TAG");
+    expect((await createTag({ method: "cashapp", handle: "$PAYME" })).body.code).toBe("TAG_EXISTS");
+
+    const hidden = await createTag({ method: "zelle", handle: "hidden@example.com" });
+    const off = await request(app).patch(`/api/admin/tags/${hidden.body.id}`).set(auth(adminTok)).send({ active: false });
+    expect(off.body.active).toBe(false);
+
+    const pub = await request(app).get("/api/public/tags");
+    expect(pub.status).toBe(200);
+    expect(pub.body.map((t) => t.handle)).toEqual(["$payme", "@pay-venmo"]);
+    expect(pub.body[0].qrDownloadUrl).toContain("fl_attachment");
+    expect(pub.body[1].qrDownloadUrl).toBeNull();
+
+    const removed = await request(app).delete(`/api/admin/tags/${venmo.body.id}`).set(auth(adminTok));
+    expect(removed.status).toBe(200);
+    expect((await request(app).get("/api/public/tags")).body.map((t) => t.handle)).toEqual(["$payme"]);
+  });
+
+  test("tags reorder within their payment method", async () => {
+    const a = await createTag({ method: "chime", handle: "chime-a" });
+    const b = await createTag({ method: "chime", handle: "chime-b" });
+    const moved = await request(app).post(`/api/admin/tags/${b.body.id}/move`).set(auth(adminTok)).send({ direction: "up" });
+    expect(moved.body.changed.length).toBe(2);
+    const list = (await request(app).get("/api/admin/tags").set(auth(adminTok))).body.filter((t) => t.method === "chime");
+    expect(list.map((t) => t.handle)).toEqual(["chime-b", "chime-a"]);
+    expect(a.status).toBe(201);
+  });
+
+  test("tag admin routes reject non-admins", async () => {
+    expect((await createTag({ method: "cashapp", handle: "$nope" }, null, userA.token)).status).toBe(403);
+    expect((await request(app).get("/api/admin/tags")).status).toBe(401);
   });
 });
 
@@ -240,8 +344,28 @@ describe("payment creation", () => {
     await Payment.deleteOne({ _id: ok.body.payment.id });
   });
 
+  test("a cashout needs its cashout method; notes are optional", async () => {
+    const base = { date: "2026-09-17", deposit: "5", loaded: "5", redeemed: "0", gameId: juwa._id };
+    expect((await submit(userA.token, { ...base, cashout: "3" }, avif(611))).body.code).toBe("INVALID_CASHOUT_METHOD");
+    expect((await submit(userA.token, { ...base, cashout: "3", cashoutMethod: "cash" }, avif(612))).body.code).toBe("INVALID_CASHOUT_METHOD");
+    expect((await submit(userA.token, { ...base, notes: "x".repeat(501) }, avif(613))).body.code).toBe("INVALID_NOTES");
+
+    const ok = await submit(userA.token, { ...base, cashout: "3", cashoutMethod: "Zelle", notes: "  paid late  " }, avif(614));
+    expect(ok.status).toBe(201);
+    const doc = await Payment.findById(ok.body.payment.id).lean();
+    expect(doc).toMatchObject({ cashoutMethod: "zelle", notes: "paid late" });
+
+    // No cashout: a sent cashout method is ignored
+    const none = await submit(userA.token, { ...base, cashoutMethod: "zelle" }, avif(615));
+    expect(none.status).toBe(201);
+    const bare = await Payment.findById(none.body.payment.id).lean();
+    expect(bare).not.toHaveProperty("cashoutMethod");
+    expect(bare).not.toHaveProperty("notes");
+    await Payment.deleteMany({ _id: { $in: [ok.body.payment.id, none.body.payment.id] } });
+  });
+
   test("cashout is optional, and so is its screenshot (stored separately)", async () => {
-    const base = { date: "2026-09-17", deposit: "5", loaded: "5", redeemed: "20", gameId: juwa._id };
+    const base = { date: "2026-09-17", deposit: "5", loaded: "5", redeemed: "20", cashoutMethod: "chime", gameId: juwa._id };
     expect((await submit(userA.token, { ...base, cashout: "-1" }, avif(602))).body.code).toBe("INVALID_AMOUNT");
     const fake = await submit(userA.token, { ...base, cashout: "1" }, avif(603), "shot.avif", Buffer.from("not an image at all, text"));
     expect(fake.body.code).toBe("UNSUPPORTED_TYPE");
@@ -351,18 +475,26 @@ describe("user data isolation", () => {
       totalLoaded: 95000,
       totalRedeemed: 0,
       totalCashout: 0,
+      depositByMethod: expect.any(Array),
+      loadedByGame: expect.any(Array),
       redeemedByGame: [
-        { gameId: String(fireKirin._id), game: "Fire Kirin", redeemed: 0 },
-        { gameId: String(juwa._id), game: "Juwa", redeemed: 0 },
+        { gameId: String(fireKirin._id), game: "Fire Kirin", amount: 0 },
+        { gameId: String(juwa._id), game: "Juwa", amount: 0 },
       ],
+      cashoutByMethod: expect.any(Array),
     });
+    // Every breakdown sums to its card's total
+    const total = (list) => list.reduce((s, r) => s + r.amount, 0);
+    expect(total(res.body.depositByMethod)).toBe(100000);
+    expect(total(res.body.loadedByGame)).toBe(95000);
+    expect(total(res.body.cashoutByMethod)).toBe(0);
   });
 
   test("list items are compact", async () => {
     const res = await request(app).get("/api/payments?limit=500").set(auth(userA.token));
     expect(res.body.items.length).toBeLessThanOrEqual(50);
     const item = res.body.items[0];
-    expect(Object.keys(item).sort()).toEqual(["date", "deposit", "game", "id", "loaded", "redeemed", "cashout", "paymentMethod", "player", "gameUsername", "paymentTag", "thumb", "cashoutThumb", "shot", "cashoutShot"].sort());
+    expect(Object.keys(item).sort()).toEqual(["date", "deposit", "game", "id", "loaded", "redeemed", "cashout", "paymentMethod", "player", "gameUsername", "paymentTag", "cashoutMethod", "notes", "thumb", "cashoutThumb", "shot", "cashoutShot"].sort());
   });
 });
 
@@ -878,7 +1010,7 @@ describe("editing entries", () => {
   });
 
   test("replaces the screenshot and adds, keeps, then replaces the cashout screenshot", async () => {
-    const res = await edit(userA.token, id, { ...base, cashout: "4" }, avif(902), png());
+    const res = await edit(userA.token, id, { ...base, cashout: "4", cashoutMethod: "chime" }, avif(902), png());
     expect(res.status).toBe(200);
     let doc = await Payment.findById(id).lean();
     expect(doc.cashout).toBe(400);
@@ -895,7 +1027,7 @@ describe("editing entries", () => {
     // A different image replaces it, and the old asset is cleaned up
     cloud.destroy.mockClear();
     const png2 = Buffer.concat([png(), Buffer.from("different")]);
-    expect((await edit(userA.token, id, { ...base, cashout: "5" }, null, png2)).status).toBe(200);
+    expect((await edit(userA.token, id, { ...base, cashout: "5", cashoutMethod: "chime" }, null, png2)).status).toBe(200);
     doc = await Payment.findById(id).lean();
     expect(doc.cashoutProof.publicId).not.toBe(first);
     expect(cloud.destroy).toHaveBeenCalledWith(first);
@@ -908,21 +1040,22 @@ describe("editing entries", () => {
     expect(fields[1]).toEqual(expect.arrayContaining(["screenshot", "cashoutProof", "cashout"]));
     expect(logs[1].changes.find((c) => c.field === "screenshot").to).toBe("replaced");
     expect(logs[1].changes.find((c) => c.field === "cashoutProof").to).toBe("added");
-    expect(fields[2]).toEqual(["cashout"]);
+    expect(fields[2]).toEqual(["cashoutMethod", "cashout"]);
     expect(logs[3].changes).toEqual([
+      { field: "cashoutMethod", from: null, to: "chime" },
       { field: "cashout", from: 0, to: 500 },
       { field: "cashoutProof", from: null, to: "replaced" },
     ]);
 
     const before = await Payment.findById(id).lean();
-    const same = await edit(userA.token, id, { ...base, cashout: "5" });
+    const same = await edit(userA.token, id, { ...base, cashout: "5", cashoutMethod: "chime" });
     expect(same.status).toBe(200);
     expect(await PaymentEdit.countDocuments({ paymentId: id })).toBe(logs.length);
     expect((await Payment.findById(id).lean()).editedAt).toEqual(before.editedAt);
   });
 
   test("admin sees a user's edits: what changed and when", async () => {
-    expect((await edit(userA.token, id, { ...base, cashout: "5", deposit: "21" })).status).toBe(200);
+    expect((await edit(userA.token, id, { ...base, cashout: "5", cashoutMethod: "chime", deposit: "21" })).status).toBe(200);
 
     const res = await request(app).get(`/api/admin/edits?userId=${userA.id}`).set(auth(adminTok));
     expect(res.status).toBe(200);
@@ -1034,7 +1167,7 @@ describe("cashout totals", () => {
   test("cashout is its own total; redeemed is not reduced by it", async () => {
     const base = { date: "2026-09-18", deposit: "50", loaded: "50", gameId: juwa._id };
     const before = (await request(app).get("/api/payments/summary").set(auth(userB.token))).body;
-    const res = await submit(userB.token, { ...base, redeemed: "30", cashout: "45.50" }, avif(7002), "shot.avif", png());
+    const res = await submit(userB.token, { ...base, redeemed: "30", cashout: "45.50", cashoutMethod: "venmo" }, avif(7002), "shot.avif", png());
     expect(res.status).toBe(201);
     id = res.body.payment.id;
 
@@ -1046,8 +1179,10 @@ describe("cashout totals", () => {
     const after = (await request(app).get("/api/payments/summary").set(auth(userB.token))).body;
     expect(after.totalRedeemed - before.totalRedeemed).toBe(3000);
     expect(after.totalCashout - before.totalCashout).toBe(4550);
+    const venmoBefore = (before.cashoutByMethod.find((m) => m.method === "venmo") || { amount: 0 }).amount;
+    expect(after.cashoutByMethod.find((m) => m.method === "venmo").amount - venmoBefore).toBe(4550);
     const juwaRow = after.redeemedByGame.find((g) => g.gameId === String(juwa._id));
-    expect(juwaRow.redeemed).toBeGreaterThanOrEqual(3000);
+    expect(juwaRow.amount).toBeGreaterThanOrEqual(3000);
   });
 });
 

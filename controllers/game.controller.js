@@ -1,8 +1,10 @@
+const crypto = require("crypto");
 const Game = require("../models/game.model.js");
 const AuditLog = require("../models/auditLog.model.js");
 const { HttpError } = require("../utils/httpError.js");
 const { toObjectId } = require("../utils/validation.js");
 const { sendCached, bump, deps } = require("../services/cache.js");
+const cloud = require("../services/cloudinary.js");
 
 // Public (authenticated) list used by the Add Entry dropdown: active games only
 // Cached in Redis until a game changes; the browser always revalidates (a cheap 304 via ETag)
@@ -25,11 +27,12 @@ const toAdminGame = (g) => ({
   slug: g.slug,
   active: g.active,
   sortOrder: g.sortOrder,
+  imageUrl: cloud.gameImageUrl(g.image),
 });
 
 const adminListGames = async (req, res) => {
   await sendCached(req, res, { name: "admin-games", deps: [deps.games] }, async () => {
-    const games = await Game.find().sort({ sortOrder: 1, name: 1 }).select("name slug active sortOrder").lean();
+    const games = await Game.find().sort({ sortOrder: 1, name: 1 }).select("name slug active sortOrder image").lean();
     return games.map(toAdminGame);
   });
 };
@@ -108,4 +111,45 @@ const moveGame = async (req, res) => {
   res.json({ changed: [] });
 };
 
-module.exports = { listActiveGames, adminListGames, createGame, updateGame, moveGame };
+// No login: the shareable public games page. Active games only, in the admin's order
+const listPublicGames = async (req, res) => {
+  await sendCached(req, res, { name: "public-games", deps: [deps.games] }, async () => {
+    const games = await Game.find({ active: true }).sort({ sortOrder: 1, name: 1 }).select("name image").lean();
+    return games.map((g) => ({ id: g._id, name: g.name, imageUrl: cloud.gameImageUrl(g.image) }));
+  });
+};
+
+// Any image is uploaded and cropped to 600x600 by Cloudinary; identical bytes reuse the same asset
+const uploadGameImage = async (req, res) => {
+  const id = toObjectId(req.params.id, "game id");
+  const game = await Game.findById(id);
+  if (!game) throw new HttpError(404, "Game not found", "NOT_FOUND");
+
+  const hash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
+  const up = await cloud.uploadGameImage(req.file.buffer, hash);
+  const previous = game.image && game.image.publicId;
+  game.image = { publicId: up.publicId, version: up.version };
+  await game.save();
+  // Another game may share the old asset (same bytes): only delete it when nothing else uses it
+  if (previous && previous !== up.publicId && !(await Game.exists({ "image.publicId": previous }))) {
+    cloud.destroy(previous).catch(() => {});
+  }
+  await Promise.all([AuditLog.record(req.userId, "game.image", "game", game._id, { action: "upload" }), bump(deps.games)]);
+  res.json(toAdminGame(game));
+};
+
+const removeGameImage = async (req, res) => {
+  const id = toObjectId(req.params.id, "game id");
+  const game = await Game.findById(id);
+  if (!game) throw new HttpError(404, "Game not found", "NOT_FOUND");
+  const previous = game.image && game.image.publicId;
+  if (previous) {
+    game.image = null;
+    await game.save();
+    if (!(await Game.exists({ "image.publicId": previous }))) cloud.destroy(previous).catch(() => {});
+    await Promise.all([AuditLog.record(req.userId, "game.image", "game", game._id, { action: "remove" }), bump(deps.games)]);
+  }
+  res.json(toAdminGame(game));
+};
+
+module.exports = { listActiveGames, listPublicGames, adminListGames, createGame, updateGame, moveGame, uploadGameImage, removeGameImage };

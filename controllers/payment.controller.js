@@ -22,9 +22,11 @@ const toListItem = (p, thumbSize = 160) => ({
   redeemed: p.redeemed || 0,
   cashout: p.cashout || 0,
   paymentMethod: p.paymentMethod || null,
+  cashoutMethod: p.cashoutMethod || null,
   player: p.player || null,
   gameUsername: p.gameUsername || null,
   paymentTag: p.paymentTag || null,
+  notes: p.notes || null,
   editedAt: p.editedAt || undefined,
   userDeletedAt: p.userDeletedAt || undefined,
   thumb: cloud.thumbUrl(p.screenshot, thumbSize),
@@ -65,12 +67,22 @@ const requiredText = (label, code) => (value) => {
 const cleanGameUsername = requiredText("Backend username", "GAME_USERNAME");
 const cleanPaymentTag = requiredText("Payment tag", "PAYMENT_TAG");
 
-const cleanPaymentMethod = (value) => {
+const methodCleaner = (label, code) => (value) => {
   const method = String(value ?? "").trim().toLowerCase();
   if (!PAYMENT_METHODS.includes(method)) {
-    throw new HttpError(400, `Payment method must be one of: ${PAYMENT_METHODS.join(", ")}`, "INVALID_PAYMENT_METHOD");
+    throw new HttpError(400, `${label} must be one of: ${PAYMENT_METHODS.join(", ")}`, code);
   }
   return method;
+};
+const cleanPaymentMethod = methodCleaner("Payment method", "INVALID_PAYMENT_METHOD");
+const cleanCashoutMethod = methodCleaner("Cashout method", "INVALID_CASHOUT_METHOD");
+
+const MAX_NOTES = 500;
+// Optional; empty = no notes
+const cleanNotes = (value) => {
+  const notes = String(value ?? "").trim();
+  if (notes.length > MAX_NOTES) throw new HttpError(400, `Notes must be at most ${MAX_NOTES} characters`, "INVALID_NOTES");
+  return notes || null;
 };
 
 // Shared by create and edit: every entry field is validated in full
@@ -84,18 +96,36 @@ const parseEntry = (body) => {
     throw new HttpError(400, "Redeemed is required (enter 0 if nothing was redeemed)", "REDEEMED_REQUIRED");
   }
   const cashoutRaw = String(body.cashout ?? "").trim();
+  // Optional; empty = 0
+  const cashout = cashoutRaw ? parseToCents(cashoutRaw, "Cashout") : 0;
   return {
     date,
     deposit: parseToCents(body.deposit, "Deposit"),
     loaded: parseToCents(body.loaded, "Loaded"),
     redeemed: parseToCents(body.redeemed, "Redeemed"),
-    // Optional; empty = 0
-    cashout: cashoutRaw ? parseToCents(cashoutRaw, "Cashout") : 0,
+    cashout,
     paymentMethod: cleanPaymentMethod(body.paymentMethod),
+    // Only a cashout has a cashout method
+    cashoutMethod: cashout > 0 ? cleanCashoutMethod(body.cashoutMethod) : null,
+    notes: cleanNotes(body.notes),
     player: cleanPlayer(body.player),
     gameUsername: cleanGameUsername(body.gameUsername),
     paymentTag: cleanPaymentTag(body.paymentTag),
   };
+};
+
+// Optional fields left empty (null) are not stored: skipped on create, unset on edit
+const OPTIONAL_FIELDS = ["cashoutMethod", "notes"];
+const splitEmpty = (entry) => {
+  const set = { ...entry };
+  const unset = {};
+  for (const f of OPTIONAL_FIELDS) {
+    if (set[f] === null) {
+      delete set[f];
+      unset[f] = "";
+    }
+  }
+  return { set, unset };
 };
 
 // Games are picked from the admin-managed list: new entries (and switching an entry to another game)
@@ -217,7 +247,7 @@ const createPayment = async (req, res) => {
     if (proof) created.push(proof.created);
     payment = await Payment.create({
       userId,
-      ...entry,
+      ...splitEmpty(entry).set,
       ...(proof ? { cashoutProof: proof.value, cashoutProofHash: proof.hash } : {}),
       ...(shot ? { screenshot: shot.value, screenshotHash: hash } : {}),
     });
@@ -262,6 +292,8 @@ const diffEntry = async (current, entry) => {
   compare("gameUsername", current.gameUsername || null, entry.gameUsername);
   compare("paymentTag", current.paymentTag || null, entry.paymentTag);
   compare("paymentMethod", current.paymentMethod || null, entry.paymentMethod);
+  compare("cashoutMethod", current.cashoutMethod || null, entry.cashoutMethod);
+  compare("notes", current.notes || null, entry.notes);
   compare("deposit", current.deposit, entry.deposit);
   compare("loaded", current.loaded, entry.loaded);
   compare("redeemed", current.redeemed || 0, entry.redeemed);
@@ -275,7 +307,7 @@ const updatePayment = async (req, res) => {
   const userId = toObjectId(req.userId, "user");
   const id = toObjectId(req.params.id, "payment id");
   const current = await Payment.findOne({ _id: id, userId, userDeletedAt: null })
-    .select("date gameId player gameUsername paymentTag paymentMethod deposit loaded redeemed cashout screenshot screenshotHash cashoutProof")
+    .select("date gameId player gameUsername paymentTag paymentMethod cashoutMethod notes deposit loaded redeemed cashout screenshot screenshotHash cashoutProof")
     .lean();
   if (!current) throw new HttpError(404, "Payment not found", "NOT_FOUND");
 
@@ -287,7 +319,7 @@ const updatePayment = async (req, res) => {
   const replaceShot = newHash && newHash !== current.screenshotHash;
   if (replaceShot) await assertNotDuplicate(userId, newHash, req.body.allowDuplicate, id);
 
-  const set = { ...entry };
+  const { set, unset } = splitEmpty(entry);
   const changes = await diffEntry(current, entry);
   const created = [];
   try {
@@ -308,7 +340,7 @@ const updatePayment = async (req, res) => {
     }
     if (changes.length) set.editedAt = new Date();
     // The user may have deleted the entry (from another tab) while this request was running
-    const result = await Payment.updateOne({ _id: id, userId, userDeletedAt: null }, { $set: set }, { runValidators: true });
+    const result = await Payment.updateOne({ _id: id, userId, userDeletedAt: null }, { $set: set, ...(Object.keys(unset).length ? { $unset: unset } : {}) }, { runValidators: true });
     if (!result.matchedCount) throw new HttpError(404, "Payment not found", "NOT_FOUND");
   } catch (err) {
     await cleanupAssets(created);
@@ -404,43 +436,69 @@ const deleteMyPayment = async (req, res) => {
   res.json({ message: "Entry deleted", id });
 };
 
+// Totals for the summary cards, each with its breakdown: deposit and cashout per payment
+// method, loaded and redeemed per game. Every breakdown sums to its total.
+const summaryTotals = async (match) => {
+  const amounts = {
+    deposit: { $sum: "$deposit" },
+    loaded: { $sum: "$loaded" },
+    redeemed: { $sum: { $ifNull: ["$redeemed", 0] } },
+    cashout: { $sum: { $ifNull: ["$cashout", 0] } },
+  };
+  const [{ byGame, byMethod, byCashoutMethod }] = await Payment.aggregate([
+    { $match: match },
+    {
+      $facet: {
+        byGame: [
+          { $group: { _id: "$gameId", ...amounts } },
+          {
+            $lookup: {
+              from: "games",
+              localField: "_id",
+              foreignField: "_id",
+              as: "game",
+              pipeline: [{ $project: { name: 1 } }],
+            },
+          },
+          { $unwind: { path: "$game", preserveNullAndEmptyArrays: true } },
+          { $sort: { "game.name": 1 } },
+        ],
+        // Older entries have no payment method (method: null)
+        byMethod: [{ $group: { _id: { $ifNull: ["$paymentMethod", null] }, deposit: amounts.deposit } }, { $sort: { _id: 1 } }],
+        // Cashouts by the method they were paid out with; older entries without one count under the
+        // deposit's method
+        byCashoutMethod: [
+          { $match: { cashout: { $gt: 0 } } },
+          { $group: { _id: { $ifNull: ["$cashoutMethod", "$paymentMethod", null] }, cashout: amounts.cashout } },
+          { $sort: { _id: 1 } },
+        ],
+      },
+    },
+  ]);
+  const sum = (rows, key) => rows.reduce((s, r) => s + r[key], 0);
+  // Highest first; the stable sort keeps ties in name order
+  const byAmount = (list) => list.sort((a, b) => b.amount - a.amount);
+  const perGame = (key) =>
+    byAmount(byGame.map((r) => ({ gameId: r._id, game: r.game ? r.game.name : null, amount: r[key] })));
+  const perMethod = (rows, key) => byAmount(rows.map((r) => ({ method: r._id, amount: r[key] })));
+  return {
+    totalDeposit: sum(byGame, "deposit"),
+    totalLoaded: sum(byGame, "loaded"),
+    totalRedeemed: sum(byGame, "redeemed"),
+    totalCashout: sum(byGame, "cashout"),
+    depositByMethod: perMethod(byMethod, "deposit"),
+    loadedByGame: perGame("loaded"),
+    redeemedByGame: perGame("redeemed"),
+    cashoutByMethod: perMethod(byCashoutMethod, "cashout"),
+  };
+};
+
 const mySummary = async (req, res) => {
   const userId = toObjectId(req.userId, "user");
   const opts = { name: "my-summary", deps: [deps.userPayments(userId)], scope: String(userId) };
-  await sendCached(req, res, opts, async () => {
-    // One group per game; the overall totals are summed from those rows
-    const rows = await Payment.aggregate([
-      { $match: { userId, userDeletedAt: null, ...myPlayerMatch(req.query) } },
-      {
-        $group: {
-          _id: "$gameId",
-          deposit: { $sum: "$deposit" },
-          loaded: { $sum: "$loaded" },
-          redeemed: { $sum: { $ifNull: ["$redeemed", 0] } },
-          cashout: { $sum: { $ifNull: ["$cashout", 0] } },
-        },
-      },
-      {
-        $lookup: {
-          from: "games",
-          localField: "_id",
-          foreignField: "_id",
-          as: "game",
-          pipeline: [{ $project: { name: 1 } }],
-        },
-      },
-      { $unwind: { path: "$game", preserveNullAndEmptyArrays: true } },
-      { $sort: { redeemed: -1, "game.name": 1 } },
-    ]);
-    const sum = (key) => rows.reduce((s, r) => s + r[key], 0);
-    return {
-      totalDeposit: sum("deposit"),
-      totalLoaded: sum("loaded"),
-      totalRedeemed: sum("redeemed"),
-      totalCashout: sum("cashout"),
-      redeemedByGame: rows.map((r) => ({ gameId: r._id, game: r.game ? r.game.name : null, redeemed: r.redeemed })),
-    };
-  });
+  await sendCached(req, res, opts, () =>
+    summaryTotals({ userId, userDeletedAt: null, ...myPlayerMatch(req.query) })
+  );
 };
 
 const getMyPayment = async (req, res) => {
@@ -460,5 +518,6 @@ module.exports = {
   getMyPayment,
   toListItem,
   gameLookup,
+  summaryTotals,
   cleanupAssets,
 };

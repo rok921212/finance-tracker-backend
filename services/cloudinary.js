@@ -60,8 +60,8 @@ const uploadScreenshot = (buffer, hash, format) => {
 const CASHOUT_FOLDER = `${FOLDER}/cashout`;
 
 /**
- * Cashout screenshot, stored next to the payment screenshots. It can be a tall capture, so only
- * the width is limited (never the height) and the original format is kept (AVIF caps dimensions).
+ * Cashout screenshot, stored next to the payment screenshots and converted to AVIF like them.
+ * It can be a tall capture, so only the width is limited (never the height).
  */
 const uploadCashoutProof = (buffer, hash) =>
   new Promise((resolve, reject) => {
@@ -70,6 +70,7 @@ const uploadCashoutProof = (buffer, hash) =>
       overwrite: false,
       unique_filename: false,
       resource_type: "image",
+      format: "avif",
       transformation: [{ width: MAX_DIMENSION, crop: "limit", quality: "auto" }],
     };
     const stream = cloudinary.uploader.upload_stream(options, (error, result) => {
@@ -80,6 +81,46 @@ const uploadCashoutProof = (buffer, hash) =>
     });
     stream.end(buffer);
   });
+
+// Stores the upload as AVIF under `publicId`, transformed once on upload (not on every delivery)
+const uploadTransformed = (buffer, publicId, transformation, label) =>
+  new Promise((resolve, reject) => {
+    const options = {
+      public_id: publicId,
+      overwrite: false,
+      unique_filename: false,
+      resource_type: "image",
+      format: "avif",
+      transformation: [transformation],
+    };
+    const stream = cloudinary.uploader.upload_stream(options, (error, result) => {
+      if (error || !result) return reject(new HttpError(502, `${label} upload failed`, "UPLOAD_FAILED"));
+      resolve({ publicId: result.public_id, version: result.version, existing: !!result.existing });
+    });
+    stream.end(buffer);
+  });
+
+const GAME_IMAGE_SIZE = 600;
+const BANNER_MAX_WIDTH = 1200;
+
+/** Game tile: any image is cropped (subject-aware) to exactly 600x600. */
+const uploadGameImage = (buffer, hash) =>
+  uploadTransformed(
+    buffer,
+    `${FOLDER}/games/${hash}`,
+    { width: GAME_IMAGE_SIZE, height: GAME_IMAGE_SIZE, crop: "fill", gravity: "auto", quality: "auto" },
+    "Game image"
+  );
+
+/** Popup banner: any aspect ratio, only the width is limited. */
+const uploadBanner = (buffer, hash) =>
+  uploadTransformed(buffer, `${FOLDER}/banners/${hash}`, { width: BANNER_MAX_WIDTH, crop: "limit", quality: "auto" }, "Banner");
+
+const TAG_QR_MAX_WIDTH = 1000;
+
+/** Payment tag QR code: never cropped (a cropped QR can't be scanned), only the width is limited. */
+const uploadTagQr = (buffer, hash) =>
+  uploadTransformed(buffer, `${FOLDER}/tags/${hash}`, { width: TAG_QR_MAX_WIDTH, crop: "limit", quality: "auto" }, "QR code");
 
 const destroy = (publicId) =>
   cloudinary.uploader.destroy(publicId, { resource_type: "image", invalidate: true });
@@ -96,4 +137,38 @@ const fullUrl = (ref) => deliveryUrl(ref, { width: MAX_DIMENSION, crop: "limit",
 
 const urls = (ref) => ({ thumb: thumbUrl(ref), full: fullUrl(ref) });
 
-module.exports = { uploadScreenshot, uploadCashoutProof, destroy, urls, thumbUrl, fullUrl, publicIdForHash, getAvifDimensions };
+const gameImageUrl = (ref) =>
+  deliveryUrl(ref, { width: GAME_IMAGE_SIZE, height: GAME_IMAGE_SIZE, crop: "fill", quality: "auto", fetch_format: "auto" });
+
+const bannerUrl = (ref) => deliveryUrl(ref, { width: BANNER_MAX_WIDTH, crop: "limit", quality: "auto", fetch_format: "auto" });
+
+const tagQrUrl = (ref) => deliveryUrl(ref, { width: TAG_QR_MAX_WIDTH, crop: "limit", quality: "auto", fetch_format: "auto" });
+
+// Served as a file download (Content-Disposition: attachment); `<a download>` is ignored cross-origin
+const tagQrDownloadUrl = (ref, filename) =>
+  ref && ref.publicId
+    ? cloudinary.url(ref.publicId, {
+        secure: true,
+        version: ref.version,
+        format: "png",
+        transformation: [{ width: TAG_QR_MAX_WIDTH, crop: "limit", flags: `attachment:${filename}` }],
+      })
+    : null;
+
+module.exports = {
+  uploadScreenshot,
+  uploadCashoutProof,
+  uploadGameImage,
+  uploadBanner,
+  uploadTagQr,
+  tagQrUrl,
+  tagQrDownloadUrl,
+  destroy,
+  urls,
+  thumbUrl,
+  fullUrl,
+  gameImageUrl,
+  bannerUrl,
+  publicIdForHash,
+  getAvifDimensions,
+};

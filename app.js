@@ -10,6 +10,7 @@ const gameRoute = require("./route/game.route.js");
 const paymentRoute = require("./route/payment.route.js");
 const adminRoute = require("./route/admin.route.js");
 const eventsRoute = require("./route/events.route.js");
+const publicRoute = require("./route/public.route.js");
 const { cacheStats } = require("./services/cache.js");
 const errorHandler = require("./middleware/errorHandler.js");
 const requestLogger = require("./middleware/requestLogger.js");
@@ -89,6 +90,8 @@ app.use("/api/games", gameRoute);
 app.use("/api/payments", paymentRoute);
 app.use("/api/admin", adminRoute);
 app.use("/api/events", eventsRoute);
+// No login: the shareable games page and its popup banner
+app.use("/api/public", publicRoute);
 
 // Includes cache counters (hits, misses, Redis fallbacks...) for monitoring; no user data
 app.get("/api/health", (req, res) => res.json({ ok: true, cache: cacheStats() }));

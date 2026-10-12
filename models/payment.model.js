@@ -35,6 +35,10 @@ const paymentSchema = new mongoose.Schema(
       required: false,
     },
     cashoutProofHash: { type: String },
+    // Method the cashout was paid out with (required when there is a cashout); older entries have none
+    cashoutMethod: { type: String, enum: [...PAYMENT_METHODS, null] },
+    // Optional free-text notes about the entry
+    notes: { type: String, trim: true, maxlength: 500 },
     // Optional payment screenshot. Only the Cloudinary reference is stored; URLs are derived on read
     screenshot: {
       type: new mongoose.Schema({ publicId: { type: String, required: true }, version: Number }, { _id: false }),

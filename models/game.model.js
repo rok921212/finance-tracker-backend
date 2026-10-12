@@ -8,6 +8,11 @@ const gameSchema = new mongoose.Schema(
     sortOrder: { type: Number, default: 0 },
     // Points pool in cents; each entry's "loaded" is taken from it. null = unlimited
     totalPoints: { type: Number, default: null, min: 0 },
+    // 600x600 tile shown on the public games page (Cloudinary ref, like payment screenshots)
+    image: {
+      type: new mongoose.Schema({ publicId: String, version: Number }, { _id: false }),
+      default: null,
+    },
   },
   { timestamps: true }
 );

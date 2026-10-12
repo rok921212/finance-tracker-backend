@@ -21,6 +21,8 @@ const listProject = {
     cashout: 1,
     cashoutProof: 1,
     paymentMethod: 1,
+    cashoutMethod: 1,
+    notes: 1,
     player: 1,
     gameUsername: 1,
     paymentTag: 1,
