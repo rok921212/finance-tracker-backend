@@ -1,17 +1,17 @@
 const bcrypt = require("bcryptjs");
 const { REGISTER_CODE } = require("../config/env.js");
 const Payment = require("../models/payment.model.js");
+const { PAYMENT_METHODS } = Payment;
 const User = require("../models/user.model.js");
 const AuditLog = require("../models/auditLog.model.js");
 const cloud = require("../services/cloudinary.js");
 const { HttpError } = require("../utils/httpError.js");
 const { toObjectId, escapeRegex, parsePagination, pageResult } = require("../utils/validation.js");
-const { buildPaymentFilter } = require("../utils/paymentFilters.js");
+const { buildPaymentFilter, listParam } = require("../utils/paymentFilters.js");
 const { toListItem, gameLookup, cleanupAssets, summaryTotals } = require("./payment.controller.js");
 const DeletedPayment = require("../models/deletedPayment.model.js");
 const PaymentEdit = require("../models/paymentEdit.model.js");
 const BookingData = require("../models/booking.model.js");
-const Game = require("../models/game.model.js");
 const PDFDocument = require("pdfkit");
 const { sendCached, bump, deps } = require("../services/cache.js");
 const { listProject, syncToken, sendChanges } = require("../utils/delta.js");
@@ -386,6 +386,21 @@ const gamesSummary = async (req, res) => {
   });
 };
 
+// Every backend username in use (case variants merged), most used first. Honours the other
+// filters but not the username filter itself, so the list doesn't shrink to the picked names.
+const gameUsernames = async (req, res) => {
+  await sendCached(req, res, { name: "admin-game-usernames", deps: [deps.payments] }, async () => {
+    const match = await buildPaymentFilter({ ...req.query, gameUsername: undefined });
+    const rows = await Payment.aggregate([
+      { $match: { ...match, gameUsername: { $nin: [null, ""] } } },
+      { $group: { _id: { $toLower: "$gameUsername" }, name: { $first: "$gameUsername" }, count: { $sum: 1 } } },
+      { $sort: { count: -1, _id: 1 } },
+      { $limit: 500 },
+    ]);
+    return rows.map((r) => ({ name: r.name, count: r.count }));
+  });
+};
+
 const centsToString = (c) => {
   const abs = Math.abs(c);
   return `${c < 0 ? "-" : ""}${Math.trunc(abs / 100)}.${String(abs % 100).padStart(2, "0")}`;
@@ -404,32 +419,48 @@ const day = (d) => d.toISOString().slice(0, 10);
 const iso = (d) => (d ? d.toISOString() : "");
 
 // Every column the exports can include. The admin picks a subset with ?columns=date,player,...
-// (none = all). `money` columns are summed into the PDF total row; `pdf: false` columns are CSV-only.
-// csv/pdf give the cell for each format when they differ; widths are relative (scaled to the page).
+// (none = all). `money` columns are summed into the PDF total rows; `pdf: false` columns are CSV-only,
+// `inCsv: false` ones PDF-only. csv/pdf give the cell for each format when they differ; `short` is the
+// PDF header label when the full one is too wide; widths are relative (scaled to the page).
+// Payment Method is CSV-only because the PDF is split into one section per method.
 const EXPORT_COLUMNS = [
   { key: "id", label: "Payment ID", pdf: false, value: (p) => p._id },
-  { key: "date", label: "Date", width: 62, value: (p) => day(p.date) },
+  { key: "date", label: "Date", width: 72, value: (p) => day(p.date) },
   { key: "user", label: "User", width: 90, value: (p) => (p.user ? p.user.username : "") },
   { key: "player", label: "Player", width: 95, value: (p) => p.player || "" },
   { key: "game", label: "Game", width: 105, value: (p) => (p.game ? p.game.name : "") },
-  { key: "gameUsername", label: "Backend Username", width: 95, value: (p) => p.gameUsername || "" },
-  { key: "paymentMethod", label: "Payment Method", width: 70, csv: (p) => p.paymentMethod || "", value: (p) => paymentMethodLabel(p.paymentMethod) },
+  { key: "gameUsername", label: "Backend Username", short: "Backend User", width: 95, value: (p) => p.gameUsername || "" },
+  { key: "paymentMethod", label: "Payment Method", pdf: false, csv: (p) => p.paymentMethod || "", value: (p) => paymentMethodLabel(p.paymentMethod) },
   { key: "paymentTag", label: "Payment Tag", width: 90, value: (p) => p.paymentTag || "" },
   { key: "deposit", label: "Deposit", width: 70, money: true, value: (p) => p.deposit },
   { key: "loaded", label: "Loaded", width: 70, money: true, value: (p) => p.loaded },
   { key: "redeemed", label: "Redeemed", width: 70, money: true, value: (p) => p.redeemed || 0 },
   { key: "cashout", label: "Cashout", width: 70, money: true, value: (p) => p.cashout || 0 },
-  { key: "cashoutMethod", label: "Cashout Method", width: 70, csv: (p) => p.cashoutMethod || "", value: (p) => paymentMethodLabel(p.cashoutMethod) },
+  { key: "cashoutMethod", label: "Cashout Method", short: "Cashout Via", width: 82, csv: (p) => p.cashoutMethod || "", value: (p) => paymentMethodLabel(p.cashoutMethod) },
+  // PDF: clickable "Photo" / "Cashout" buttons; the full URLs are listed on the Image Links page
+  { key: "links", label: "Images", width: 100, inCsv: false, value: () => "" },
   { key: "notes", label: "Notes", pdf: false, value: (p) => p.notes || "" },
   { key: "createdAt", label: "Created At", pdf: false, value: (p) => iso(p.createdAt) },
   { key: "editedAt", label: "Edited At", pdf: false, value: (p) => iso(p.editedAt) },
+  { key: "screenshotUrl", label: "Screenshot URL", pdf: false, value: (p) => cloud.fullUrl(p.screenshot) || "" },
+  { key: "cashoutProofUrl", label: "Cashout Proof URL", pdf: false, value: (p) => cloud.fullUrl(p.cashoutProof) || "" },
 ];
 
 // ?columns=a,b,c -> those columns in the standard order; unknown keys are ignored, none/empty = all
 const pickColumns = (raw) => {
-  const wanted = new Set(String(raw ?? "").split(",").map((k) => k.trim()).filter(Boolean));
+  const wanted = new Set(listParam(raw, 100));
   const picked = EXPORT_COLUMNS.filter((c) => wanted.has(c.key));
   return picked.length ? picked : EXPORT_COLUMNS;
+};
+
+// ?filename= -> a safe download name without extension; falls back to payments-YYYY-MM-DD
+const exportFilename = (raw, ext) => {
+  const name = String(raw ?? "")
+    .replace(/\.(csv|pdf)$/i, "")
+    .replace(/[^\w.\- ]/g, "_")
+    .replace(/^[.\s]+|[.\s]+$/g, "")
+    .slice(0, 80);
+  return `${name || `payments-${new Date().toISOString().slice(0, 10)}`}.${ext}`;
 };
 
 const cellOf = (c, p, format) => {
@@ -443,10 +474,10 @@ const exportCursor = (match) =>
 // Streams CSV for the currently filtered payments; never buffers the full result set
 const exportCsv = async (req, res) => {
   const match = await buildPaymentFilter(req.query);
-  const columns = pickColumns(req.query.columns);
-  const stamp = new Date().toISOString().slice(0, 10);
+  let columns = pickColumns(req.query.columns).filter((c) => c.inCsv !== false);
+  if (!columns.length) columns = EXPORT_COLUMNS.filter((c) => c.inCsv !== false);
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="payments-${stamp}.csv"`);
+  res.setHeader("Content-Disposition", `attachment; filename="${exportFilename(req.query.filename, "csv")}"`);
   res.write(columns.map((c) => csvCell(c.label)).join(",") + "\n");
 
   for await (const p of exportCursor(match)) {
@@ -456,90 +487,360 @@ const exportCsv = async (req, res) => {
   res.end();
 };
 
-// Human-readable list of the active filters, printed at the top of the PDF
-const describeFilters = async (q) => {
-  const parts = [];
-  if (q.dateFrom || q.dateTo) parts.push(`Date: ${q.dateFrom || "start"} to ${q.dateTo || "today"}`);
-  if (q.userId) {
-    const u = await User.findById(q.userId).select("username").lean();
-    parts.push(`User: ${u ? u.username : q.userId}`);
-  } else if (q.search) parts.push(`User: ${q.search}*`);
-  if (q.player) parts.push(`Player: ${q.player}*`);
-  if (q.paymentMethod) parts.push(`Payment: ${paymentMethodLabel(q.paymentMethod)}`);
-  if (q.gameId) {
-    const g = await Game.findById(q.gameId).select("name").lean();
-    parts.push(`Game: ${g ? g.name : q.gameId}`);
-  }
-  return parts.length ? parts.join("   |   ") : "None (all entries)";
+// ---- PDF report ----
+
+const PDF = {
+  ink: "#111827",
+  muted: "#6b7280",
+  faint: "#9ca3af",
+  line: "#e5e7eb",
+  zebra: "#f9fafb",
+  head: "#1f2937",
+  accent: "#dc2626",
+  photo: "#2563eb",
+  cashout: "#d97706",
+  link: "#1d4ed8",
+};
+// Colour of each method's section ("" = entries without a method)
+const METHOD_COLORS = { cashapp: "#00a650", venmo: "#008cff", paypal: "#003087", zelle: "#6d1ed4", applepay: "#111827", chime: "#16a34a", "": "#6b7280" };
+const methodTitle = (m) => paymentMethodLabel(m) || "No payment method";
+const entries = (n) => `${n} ${n === 1 ? "entry" : "entries"}`;
+
+// "$1,234.56" for the PDF (the CSV keeps plain 1234.56)
+const money = (c) => {
+  const s = centsToString(c);
+  return (s.startsWith("-") ? "-$" : "$") + s.replace("-", "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 };
 
-// Streams a PDF table of the currently filtered payments (same filters as the list and CSV)
+// Count and totals per payment method, in section order
+const methodStats = async (match) => {
+  const rows = await Payment.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: { $ifNull: ["$paymentMethod", ""] },
+        count: { $sum: 1 },
+        deposit: { $sum: "$deposit" },
+        loaded: { $sum: "$loaded" },
+        redeemed: { $sum: { $ifNull: ["$redeemed", 0] } },
+        cashout: { $sum: { $ifNull: ["$cashout", 0] } },
+      },
+    },
+  ]);
+  const order = (m) => (m ? PAYMENT_METHODS.indexOf(m) : PAYMENT_METHODS.length);
+  return rows.sort((a, b) => order(a._id) - order(b._id));
+};
+
+// PDF order: grouped by payment method (PAYMENT_METHODS order, entries without one last), newest first in each group
+const pdfCursor = (match) =>
+  Payment.aggregate([
+    { $match: match },
+    { $addFields: { _methodOrder: { $indexOfArray: [PAYMENT_METHODS, { $ifNull: ["$paymentMethod", ""] }] } } },
+    { $addFields: { _methodOrder: { $cond: [{ $lt: ["$_methodOrder", 0] }, PAYMENT_METHODS.length, "$_methodOrder"] } } },
+    { $sort: { _methodOrder: 1, date: -1, _id: -1 } },
+    ...gameLookup,
+    ...userLookup,
+  ])
+    .allowDiskUse(true)
+    .cursor({ batchSize: 500 });
+
+// Streams a PDF report of the currently filtered payments (same filters as the list and CSV): summary
+// cards, one section per payment method with its subtotal, the grand total, then a page listing every
+// image link in full (the table itself only has small "Photo" / "Cashout" buttons)
 const exportPdf = async (req, res) => {
   const match = await buildPaymentFilter(req.query);
-  const filtersLine = await describeFilters(req.query);
-  let columns = pickColumns(req.query.columns).filter((c) => c.pdf !== false);
-  if (!columns.length) columns = EXPORT_COLUMNS.filter((c) => c.pdf !== false);
-  const stamp = new Date().toISOString().slice(0, 10);
+  const stats = await methodStats(match);
+  let picked = pickColumns(req.query.columns).filter((c) => c.pdf !== false);
+  if (!picked.length) picked = EXPORT_COLUMNS.filter((c) => c.pdf !== false);
+  // Row number first: the Image Links page refers back to it
+  const columns = [{ key: "no", label: "#", width: 30, value: () => "" }, ...picked];
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="payments-${stamp}.pdf"`);
+  res.setHeader("Content-Disposition", `attachment; filename="${exportFilename(req.query.filename, "pdf")}"`);
 
-  const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 30 });
+  const doc = new PDFDocument({
+    size: "A4",
+    layout: "landscape",
+    margins: { top: 30, bottom: 42, left: 30, right: 30 },
+    info: { Title: "Payments Report" },
+  });
   doc.pipe(res);
   const left = doc.page.margins.left;
+  const top = doc.page.margins.top;
+  const pageWidth = doc.page.width - left - doc.page.margins.right;
   const bottom = () => doc.page.height - doc.page.margins.bottom;
-  // Scale the picked columns to fill the page width, whichever subset was chosen
-  const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-  const scale = pageWidth / columns.reduce((s, c) => s + c.width, 0);
-  const widths = columns.map((c) => c.width * scale);
-  const ROW_H = 16;
+  const generated = `${new Date().toISOString().replace("T", " ").slice(0, 16)} UTC`;
+  const ROW_H = 18;
   let y;
 
-  const drawRow = (cells, { bold = false, fill = null } = {}) => {
-    if (fill) doc.rect(left, y - 3, pageWidth, ROW_H).fill(fill);
-    doc.fillColor("#000").font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(8);
+  // Footer on every page. The bottom margin is lifted while drawing it so pdfkit doesn't start a new page.
+  let pageNo = 0;
+  const footer = () => {
+    pageNo += 1;
+    const margin = doc.page.margins.bottom;
+    doc.page.margins.bottom = 0;
+    const fy = doc.page.height - 26;
+    doc.moveTo(left, fy - 7).lineTo(left + pageWidth, fy - 7).lineWidth(0.5).strokeColor(PDF.line).stroke();
+    doc.font("Helvetica").fontSize(7.5).fillColor(PDF.muted);
+    doc.text(`Payments Report  ·  Generated ${generated}`, left, fy, { width: pageWidth / 2, lineBreak: false });
+    doc.text(`Page ${pageNo}`, left + pageWidth / 2, fy, { width: pageWidth / 2, align: "right", lineBreak: false });
+    doc.page.margins.bottom = margin;
+  };
+  footer();
+  doc.on("pageAdded", footer);
+
+  // What to redraw at the top of a continuation page (section heading, table header)
+  let onNewPage = () => {};
+  const ensureRoom = (h) => {
+    if (y + h > bottom()) {
+      doc.addPage();
+      y = top;
+      onNewPage();
+    }
+  };
+
+  // One line of text, vertically centred in a row of height `h`
+  const cellText = (text, x, w, { bold = false, color = PDF.ink, align = "left", size = 8, h = ROW_H } = {}) =>
+    doc
+      .fillColor(color)
+      .font(bold ? "Helvetica-Bold" : "Helvetica")
+      .fontSize(size)
+      .text(String(text ?? ""), x + 4, y + (h - size) / 2 + 0.5, { width: w - 8, align, lineBreak: false, ellipsis: true, height: h });
+  const rule = (atY) => doc.moveTo(left, atY).lineTo(left + pageWidth, atY).lineWidth(0.4).strokeColor(PDF.line).stroke();
+
+  // ---- title band, summary cards, per-method chips (the filters used are not printed) ----
+  doc.rect(0, 0, doc.page.width, 62).fill(PDF.head);
+  doc.rect(0, 62, doc.page.width, 3).fill(PDF.accent);
+  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(20).text("Payments Report", left, 21, { lineBreak: false });
+  doc.fillColor("#d1d5db").font("Helvetica").fontSize(9).text(`Generated ${generated}`, left, 28, { width: pageWidth, align: "right", lineBreak: false });
+
+  y = 84;
+
+  const all = stats.reduce(
+    (t, s) => ({ count: t.count + s.count, deposit: t.deposit + s.deposit, loaded: t.loaded + s.loaded, redeemed: t.redeemed + s.redeemed, cashout: t.cashout + s.cashout }),
+    { count: 0, deposit: 0, loaded: 0, redeemed: 0, cashout: 0 }
+  );
+  const cards = [
+    ["Entries", String(all.count), PDF.ink],
+    ["Deposit", money(all.deposit), "#059669"],
+    ["Loaded", money(all.loaded), "#2563eb"],
+    ["Redeemed", money(all.redeemed), "#7c3aed"],
+    ["Cashout", money(all.cashout), "#d97706"],
+  ];
+  const gap = 10;
+  const cardW = (pageWidth - gap * (cards.length - 1)) / cards.length;
+  const cardH = 48;
+  cards.forEach(([label, value, color], i) => {
+    const cx = left + i * (cardW + gap);
+    doc.roundedRect(cx, y, cardW, cardH, 6).lineWidth(0.75).fillAndStroke(PDF.zebra, PDF.line);
+    doc.rect(cx, y + 10, 3, cardH - 20).fill(color);
+    doc.fillColor(PDF.muted).font("Helvetica-Bold").fontSize(7.5).text(label.toUpperCase(), cx + 12, y + 10, { width: cardW - 20, lineBreak: false });
+    doc.fillColor(color).font("Helvetica-Bold").fontSize(15).text(value, cx + 12, y + 23, { width: cardW - 20, lineBreak: false, ellipsis: true });
+  });
+  y += cardH + 10;
+
+  let chipX = left;
+  stats.forEach((s) => {
+    const label = `${methodTitle(s._id)}   ${entries(s.count)}  ·  ${money(s.deposit)}`;
+    doc.font("Helvetica").fontSize(8);
+    const w = doc.widthOfString(label) + 24;
+    if (chipX + w > left + pageWidth) {
+      chipX = left;
+      y += 22;
+    }
+    doc.roundedRect(chipX, y, w, 17, 8.5).lineWidth(0.75).fillAndStroke("#ffffff", PDF.line);
+    doc.circle(chipX + 10, y + 8.5, 3.2).fill(METHOD_COLORS[s._id] || PDF.muted);
+    doc.fillColor(PDF.ink).font("Helvetica").fontSize(8).text(label, chipX + 17, y + 5, { lineBreak: false });
+    chipX += w + 6;
+  });
+  y += 30;
+
+  if (!stats.length) {
+    doc.fillColor(PDF.muted).font("Helvetica").fontSize(11).text("No entries match these filters.", left, y, { width: pageWidth, align: "center" });
+    doc.end();
+    return;
+  }
+
+  // ---- tables, one per payment method ----
+  const scale = pageWidth / columns.reduce((s, c) => s + c.width, 0);
+  const widths = columns.map((c) => c.width * scale);
+  const moneyCols = columns.filter((c) => c.money);
+  const zeroSums = () => Object.fromEntries(moneyCols.map((c) => [c.key, 0]));
+
+  const tableHeader = () => {
+    doc.rect(left, y, pageWidth, ROW_H).fill(PDF.head);
     let x = left;
     columns.forEach((c, i) => {
-      doc.text(String(cells[i] ?? ""), x + 3, y, { width: widths[i] - 6, align: c.money ? "right" : "left", lineBreak: false, ellipsis: true, height: ROW_H });
+      cellText((c.short || c.label).toUpperCase(), x, widths[i], { bold: true, color: "#ffffff", align: c.money ? "right" : "left", size: 6.8 });
       x += widths[i];
     });
     y += ROW_H;
   };
-  const header = () => {
-    drawRow(columns.map((c) => c.label), { bold: true, fill: "#e5e7eb" });
-  };
-  const ensureRoom = () => {
-    if (y + ROW_H > bottom()) {
-      doc.addPage();
-      y = doc.page.margins.top;
-      header();
-    }
+
+  let section = null; // { method, stat } being drawn
+  const SECTION_H = 26;
+  const sectionHeading = (continued = false) => {
+    const color = METHOD_COLORS[section.method] || PDF.muted;
+    doc.save();
+    doc.rect(left, y, pageWidth, SECTION_H).fillOpacity(0.08).fill(color);
+    doc.restore();
+    doc.rect(left, y, 4, SECTION_H).fill(color);
+    doc.fillColor(color).font("Helvetica-Bold").fontSize(12).text(methodTitle(section.method) + (continued ? "  (continued)" : ""), left + 14, y + 8, { width: pageWidth / 2, lineBreak: false });
+    const s = section.stat;
+    const summary = `${entries(s.count)}   ·   Deposit ${money(s.deposit)}   ·   Loaded ${money(s.loaded)}`;
+    doc.fillColor(PDF.muted).font("Helvetica").fontSize(8.5).text(summary, left + pageWidth / 2, y + 9.5, { width: pageWidth / 2 - 12, align: "right", lineBreak: false });
+    y += SECTION_H + 4;
   };
 
-  doc.font("Helvetica-Bold").fontSize(16).text("Payments Report", left, doc.page.margins.top);
-  doc.font("Helvetica").fontSize(9).fillColor("#444").text(`Generated: ${new Date().toISOString().replace("T", " ").slice(0, 16)} UTC`);
-  doc.text(`Filters: ${filtersLine}`);
-  doc.moveDown(0.8);
-  y = doc.y;
-  header();
-
-  let count = 0;
-  const totals = Object.fromEntries(columns.filter((c) => c.money).map((c) => [c.key, 0]));
-  for await (const p of exportCursor(match)) {
-    ensureRoom();
-    count += 1;
-    columns.forEach((c) => {
-      if (c.money) totals[c.key] += c.value(p);
+  // Subtotal / grand total: the label spans the text columns before the first money column (after #),
+  // sums go under the money columns
+  const firstMoney = columns.findIndex((c) => c.money);
+  const labelEnd = firstMoney < 0 ? columns.length : firstMoney;
+  const labelWidth = widths.slice(1, labelEnd).reduce((s, w) => s + w, 0);
+  const sumRow = (label, count, sums, { dark = false } = {}) => {
+    ensureRoom(ROW_H);
+    doc.rect(left, y, pageWidth, ROW_H).fill(dark ? PDF.head : "#f3f4f6");
+    const color = dark ? "#ffffff" : PDF.ink;
+    if (labelWidth) cellText(`${label}   ·   ${entries(count)}`, left + widths[0], labelWidth, { bold: true, color });
+    let x = left;
+    columns.forEach((c, i) => {
+      if (c.money) cellText(money(sums[c.key]), x, widths[i], { bold: true, color, align: "right" });
+      x += widths[i];
     });
-    drawRow(
-      columns.map((c) => cellOf(c, p, "pdf")),
-      { fill: count % 2 === 0 ? "#f9fafb" : null }
-    );
+    y += ROW_H;
+  };
+
+  // Small rounded buttons that open the images; every link is also listed on the Image Links page
+  const links = [];
+  const IMAGE_BUTTONS = [
+    { label: "Photo", type: "Payment screenshot", color: PDF.photo, url: (p) => cloud.fullUrl(p.screenshot) },
+    { label: "Cashout", type: "Cashout proof", color: PDF.cashout, url: (p) => cloud.fullUrl(p.cashoutProof) },
+  ];
+  const imageButtons = (p, no, x, w) => {
+    const items = IMAGE_BUTTONS.map((b) => ({ ...b, url: b.url(p) })).filter((b) => b.url);
+    if (!items.length) return cellText("-", x, w, { color: PDF.faint });
+    let bx = x + 4;
+    items.forEach((b) => {
+      links.push({ no, date: day(p.date), player: p.player || "", backend: p.gameUsername || "", type: b.type, color: b.color, url: b.url });
+      doc.font("Helvetica-Bold").fontSize(6.5);
+      const bw = doc.widthOfString(b.label) + 10;
+      const bh = 11;
+      const by = y + (ROW_H - bh) / 2;
+      if (bx + bw > x + w) return; // no room for another button in a narrow column
+      doc.roundedRect(bx, by, bw, bh, 5.5).fill(b.color);
+      doc.fillColor("#ffffff").text(b.label, bx, by + 2.7, { width: bw, align: "center", lineBreak: false });
+      doc.link(bx, by, bw, bh, b.url);
+      bx += bw + 4;
+    });
+  };
+
+  const dataRow = (p, no, zebra) => {
+    if (zebra) doc.rect(left, y, pageWidth, ROW_H).fill(PDF.zebra);
+    let x = left;
+    columns.forEach((c, i) => {
+      if (c.key === "no") cellText(no, x, widths[i], { color: PDF.muted, size: 7.5 });
+      else if (c.key === "links") imageButtons(p, no, x, widths[i]);
+      else if (c.money) {
+        const v = c.value(p);
+        cellText(money(v), x, widths[i], { align: "right", color: v ? PDF.ink : PDF.faint });
+      } else cellText(c.value(p), x, widths[i]);
+      x += widths[i];
+    });
+    rule(y + ROW_H);
+    y += ROW_H;
+  };
+
+  onNewPage = () => {
+    if (section) sectionHeading(true);
+    tableHeader();
+  };
+
+  let no = 0;
+  let groupCount = 0;
+  let groupSums = zeroSums();
+  const totals = zeroSums();
+  const closeSection = () => {
+    if (section) sumRow(`${methodTitle(section.method)} subtotal`, groupCount, groupSums);
+    section = null;
+  };
+
+  for await (const p of pdfCursor(match)) {
+    const method = p.paymentMethod || "";
+    if (!section || section.method !== method) {
+      closeSection();
+      if (no) y += 14;
+      // Keep the heading with its table header and first rows
+      ensureRoom(SECTION_H + 4 + ROW_H * 3);
+      section = { method, stat: stats.find((s) => s._id === method) || { count: 0, deposit: 0, loaded: 0 } };
+      groupCount = 0;
+      groupSums = zeroSums();
+      sectionHeading();
+      tableHeader();
+    }
+    ensureRoom(ROW_H);
+    no += 1;
+    groupCount += 1;
+    moneyCols.forEach((c) => {
+      totals[c.key] += c.value(p);
+      groupSums[c.key] += c.value(p);
+    });
+    dataRow(p, no, groupCount % 2 === 0);
   }
-  ensureRoom();
-  // Total row: "Total" and the entry count in the first text columns, sums under the money columns
-  const labels = ["Total", `${count} entries`];
-  const totalRow = columns.map((c) => (c.money ? centsToString(totals[c.key]) : labels.shift() || ""));
-  drawRow(totalRow, { bold: true, fill: "#e5e7eb" });
+  closeSection();
+  onNewPage = tableHeader;
+  y += 14;
+  sumRow("Grand total", no, totals, { dark: true });
+
+  // ---- Image Links page: every link in full, to click or copy ----
+  if (links.length) {
+    const lcols = [
+      ["#", 30],
+      ["Date", 62],
+      ["Player", 110],
+      ["Backend Username", 110],
+      ["Image", 100],
+    ];
+    const fixed = lcols.reduce((s, [, w]) => s + w, 0);
+    lcols.push(["Link (click or copy)", pageWidth - fixed]);
+    const linksHeader = () => {
+      doc.rect(left, y, pageWidth, ROW_H).fill(PDF.head);
+      let x = left;
+      lcols.forEach(([label, w]) => {
+        cellText(label.toUpperCase(), x, w, { bold: true, color: "#ffffff", size: 6.8 });
+        x += w;
+      });
+      y += ROW_H;
+    };
+    onNewPage = linksHeader;
+    doc.addPage();
+    y = top;
+    doc.fillColor(PDF.ink).font("Helvetica-Bold").fontSize(16).text("Image Links", left, y, { lineBreak: false });
+    doc
+      .fillColor(PDF.muted)
+      .font("Helvetica")
+      .fontSize(9)
+      .text("The full link of every image in the report. Click one to open it, or select it to copy. # matches the row number in the tables.", left, y + 22, { lineBreak: false });
+    y += 42;
+    linksHeader();
+
+    const urlW = lcols[lcols.length - 1][1] - 8;
+    links.forEach((l, i) => {
+      doc.font("Helvetica").fontSize(7);
+      const h = Math.max(ROW_H, doc.heightOfString(l.url, { width: urlW }) + 9);
+      ensureRoom(h);
+      if (i % 2) doc.rect(left, y, pageWidth, h).fill(PDF.zebra);
+      let x = left;
+      [l.no, l.date, l.player, l.backend].forEach((v, j) => {
+        cellText(v, x, lcols[j][1], { color: j ? PDF.ink : PDF.muted, h });
+        x += lcols[j][1];
+      });
+      doc.circle(x + 8, y + h / 2, 2.8).fill(l.color);
+      cellText(l.type, x + 9, lcols[4][1] - 9, { h });
+      x += lcols[4][1];
+      doc.fillColor(PDF.link).font("Helvetica").fontSize(7).text(l.url, x + 4, y + 5, { width: urlW, link: l.url });
+      rule(y + h);
+      y += h;
+    });
+  }
   doc.end();
 };
 
@@ -636,6 +937,7 @@ module.exports = {
   updateUser,
   deleteUser,
   gamesSummary,
+  gameUsernames,
   exportCsv,
   exportPdf,
   listAudit,

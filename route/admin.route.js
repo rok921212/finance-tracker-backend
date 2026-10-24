@@ -20,6 +20,7 @@ router.get("/payments", asyncHandler(admin.listPayments));
 router.get("/payments/export.csv", asyncHandler(admin.exportCsv));
 router.get("/payments/export.pdf", asyncHandler(admin.exportPdf));
 router.get("/payments/changes", asyncHandler(admin.paymentChanges));
+router.get("/payments/game-usernames", asyncHandler(admin.gameUsernames));
 router.get("/payments/:id", asyncHandler(admin.getPayment));
 router.delete("/payments/:id", asyncHandler(admin.deletePayment));
 router.get("/edits", asyncHandler(admin.listEdits));

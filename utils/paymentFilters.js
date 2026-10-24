@@ -5,6 +5,9 @@ const { parseDay, toObjectId, escapeRegex } = require("./validation.js");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// "a,b,,a" -> ["a", "b"]: trimmed, de-duplicated, capped so a query can't grow unbounded
+const listParam = (v, max = 50) => [...new Set(String(v ?? "").split(",").map((s) => s.trim()).filter(Boolean))].slice(0, max);
+
 /**
  * Builds a Payment $match from whitelisted query params.
  * Shared by the admin list, summaries and CSV export so they always agree.
@@ -21,9 +24,17 @@ const buildPaymentFilter = async (query) => {
 
   if (query.gameId) match.gameId = toObjectId(query.gameId, "gameId");
 
-  if (query.paymentMethod) {
-    if (!PAYMENT_METHODS.includes(query.paymentMethod)) throw new HttpError(400, "Invalid paymentMethod", "INVALID_PAYMENT_METHOD");
-    match.paymentMethod = query.paymentMethod;
+  // One or more methods, comma-separated
+  const methods = listParam(query.paymentMethod);
+  if (methods.length) {
+    if (methods.some((m) => !PAYMENT_METHODS.includes(m))) throw new HttpError(400, "Invalid paymentMethod", "INVALID_PAYMENT_METHOD");
+    match.paymentMethod = methods.length === 1 ? methods[0] : { $in: methods };
+  }
+
+  // Game-backend usernames, comma-separated; exact match ignoring case ("zyron" matches "Zyron")
+  const gameUsernames = listParam(query.gameUsername);
+  if (gameUsernames.length) {
+    match.gameUsername = { $in: gameUsernames.map((n) => new RegExp("^" + escapeRegex(n.slice(0, 60)) + "$", "i")) };
   }
 
   // Player name the entry was loaded under (prefix, case-insensitive)
@@ -46,4 +57,4 @@ const buildPaymentFilter = async (query) => {
   return match;
 };
 
-module.exports = { buildPaymentFilter };
+module.exports = { buildPaymentFilter, listParam };

@@ -746,6 +746,60 @@ describe("admin", () => {
 
     await request(app).delete(`/api/admin/payments/${res.body.payment.id}`).set(auth(adminTok));
   });
+
+  test("backend username list and filter ignore case; several payment methods; export file name", async () => {
+    const entries = [
+      { gameUsername: "Zyron", paymentMethod: "paypal" },
+      { gameUsername: "zyron", paymentMethod: "cashapp" },
+      { gameUsername: "Zyron2", paymentMethod: "paypal" },
+      { gameUsername: "pandey", paymentMethod: "venmo" },
+    ];
+    const ids = [];
+    for (const [i, e] of entries.entries()) {
+      const r = await submit(userA.token, { date: "2026-09-17", deposit: "5", loaded: "5", gameId: fireKirin._id, ...e }, avif(9500 + i));
+      expect(r.status).toBe(201);
+      ids.push(r.body.payment.id);
+    }
+
+    // Case variants are merged into one name with their combined count
+    const names = await request(app).get("/api/admin/payments/game-usernames?dateFrom=2026-09-17&dateTo=2026-09-17").set(auth(adminTok));
+    expect(names.status).toBe(200);
+    const byName = Object.fromEntries(names.body.map((n) => [n.name.toLowerCase(), n.count]));
+    expect(byName).toMatchObject({ zyron: 2, zyron2: 1, pandey: 1 });
+    // The username filter itself doesn't narrow the list
+    const unfiltered = await request(app).get("/api/admin/payments/game-usernames?gameUsername=pandey&dateFrom=2026-09-17&dateTo=2026-09-17").set(auth(adminTok));
+    expect(unfiltered.body.length).toBe(names.body.length);
+    expect((await request(app).get("/api/admin/payments/game-usernames").set(auth(userA.token))).status).toBe(403);
+
+    // Exact name, any case: "zyron" matches "Zyron" and "zyron" but not "Zyron2"
+    const one = await request(app).get("/api/admin/payments?gameUsername=ZYRON").set(auth(adminTok));
+    expect(one.body.items.map((i) => i.gameUsername).sort()).toEqual(["Zyron", "zyron"]);
+    const two = await request(app).get("/api/admin/payments?gameUsername=zyron,pandey").set(auth(adminTok));
+    expect(two.body.total).toBe(3);
+
+    const methods = await request(app).get("/api/admin/payments?gameUsername=zyron,zyron2,pandey&paymentMethod=paypal,venmo").set(auth(adminTok));
+    expect(methods.body.items.map((i) => i.paymentMethod).sort()).toEqual(["paypal", "paypal", "venmo"]);
+    expect((await request(app).get("/api/admin/payments?paymentMethod=paypal,bitcoin").set(auth(adminTok))).status).toBe(400);
+
+    // CSV carries the screenshot URL; the file name is the admin's choice, sanitised
+    const csv = await request(app).get("/api/admin/payments/export.csv?gameUsername=pandey&columns=gameUsername,screenshotUrl&filename=../My%20Report").set(auth(adminTok));
+    expect(csv.headers["content-disposition"]).toBe('attachment; filename="_My Report.csv"');
+    expect(csv.text.trim().split("\n")[1]).toMatch(/^pandey,"https:\/\/res\.cloudinary\.com\/.+"$/);
+
+    // The PDF-only Images column never reaches the CSV, even when it is the only one picked
+    const allCsv = await request(app).get("/api/admin/payments/export.csv?gameUsername=pandey").set(auth(adminTok));
+    expect(allCsv.text.split("\n")[0]).not.toContain("Images");
+    const onlyImages = await request(app).get("/api/admin/payments/export.csv?gameUsername=pandey&columns=links").set(auth(adminTok));
+    expect(onlyImages.text.split("\n")[0]).toContain("Payment ID,Date");
+
+    const pdf = await request(app).get("/api/admin/payments/export.pdf?gameUsername=zyron,zyron2,pandey&filename=weekly.pdf").set(auth(adminTok));
+    expect(pdf.status).toBe(200);
+    expect(pdf.headers["content-disposition"]).toBe('attachment; filename="weekly.pdf"');
+    const noName = await request(app).get("/api/admin/payments/export.pdf?gameUsername=pandey&columns=player,deposit").set(auth(adminTok));
+    expect(noName.headers["content-disposition"]).toMatch(/filename="payments-\d{4}-\d{2}-\d{2}\.pdf"/);
+
+    for (const id of ids) await request(app).delete(`/api/admin/payments/${id}`).set(auth(adminTok));
+  });
 });
 
 describe("booking API (delta writes)", () => {
