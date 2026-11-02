@@ -23,6 +23,9 @@ const env = {
   REDIS_URL: process.env.REDIS_URL,
   UPSTASH_REDIS_REST_URL: process.env.UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN,
+  // Encrypts game backend passwords (services/secretBox.js). Without it in production, the
+  // game-logins feature is disabled (503) but the rest of the API runs.
+  CREDENTIALS_KEY: process.env.CREDENTIALS_KEY,
   ADMIN_USERNAME: process.env.ADMIN_USERNAME,
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,
 };

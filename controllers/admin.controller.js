@@ -468,19 +468,87 @@ const cellOf = (c, p, format) => {
   return c.money ? centsToString(v) : v;
 };
 
-const exportCursor = (match) =>
-  Payment.aggregate([{ $match: match }, { $sort: { date: -1, _id: -1 } }, ...gameLookup, ...userLookup]).cursor({ batchSize: 500 });
+// ---- Backend-username merging and grouping (export only; stored data is never changed) ----
 
-// Streams CSV for the currently filtered payments; never buffers the full result set
+const MAX_MERGE_GROUPS = 50;
+const MAX_MERGE_MEMBERS = 100;
+
+// ?merge=[{"name":"John","members":["john1","John_1"]}] -> [{ name, members: lowercased }].
+// The group name itself is always a member. A name listed in several groups belongs to the first one.
+const parseMerge = (raw) => {
+  if (raw == null || String(raw).trim() === "") return [];
+  let data;
+  try {
+    data = JSON.parse(String(raw));
+  } catch {
+    throw new HttpError(400, "merge must be valid JSON", "INVALID_MERGE");
+  }
+  if (!Array.isArray(data) || data.length > MAX_MERGE_GROUPS) {
+    throw new HttpError(400, `merge must be a list of at most ${MAX_MERGE_GROUPS} groups`, "INVALID_MERGE");
+  }
+  const seen = new Set();
+  const groups = [];
+  for (const g of data) {
+    const name = String(g && g.name != null ? g.name : "").trim();
+    if (!name || name.length > 60) throw new HttpError(400, "Each merge group needs a name of 1-60 characters", "INVALID_MERGE");
+    if (!Array.isArray(g.members) || g.members.length > MAX_MERGE_MEMBERS) {
+      throw new HttpError(400, `Each merge group needs a list of at most ${MAX_MERGE_MEMBERS} members`, "INVALID_MERGE");
+    }
+    const members = [...new Set([name, ...g.members].map((m) => String(m ?? "").trim().slice(0, 60).toLowerCase()).filter(Boolean))].filter(
+      (m) => !seen.has(m)
+    );
+    members.forEach((m) => seen.add(m));
+    if (members.length) groups.push({ name, members });
+  }
+  return groups;
+};
+
+const usernameExpr = { $ifNull: ["$gameUsername", ""] };
+// The (possibly merged) backend username an entry is reported under
+const groupNameExpr = (groups) =>
+  groups.length
+    ? { $switch: { branches: groups.map((g) => ({ case: { $in: [{ $toLower: usernameExpr }, g.members] }, then: g.name })), default: usernameExpr } }
+    : usernameExpr;
+
+const methodOrderStages = [
+  { $addFields: { _methodOrder: { $indexOfArray: [PAYMENT_METHODS, { $ifNull: ["$paymentMethod", ""] }] } } },
+  { $addFields: { _methodOrder: { $cond: [{ $lt: ["$_methodOrder", 0] }, PAYMENT_METHODS.length, "$_methodOrder"] } } },
+];
+
+// Export rows: newest first, or (byMethod) grouped by payment method, then optionally by backend username.
+// Every row gets _group (its merged backend username) and _groupKey (lowercase, what rows are grouped by).
+const exportCursor = (match, { merge = [], byMethod = false, byUsername = false } = {}) => {
+  const sort = byMethod ? { _methodOrder: 1, ...(byUsername ? { _groupKey: 1 } : {}), date: -1, _id: -1 } : { date: -1, _id: -1 };
+  return Payment.aggregate([
+    { $match: match },
+    { $addFields: { _group: groupNameExpr(merge) } },
+    { $addFields: { _groupKey: { $toLower: "$_group" } } },
+    ...(byMethod ? methodOrderStages : []),
+    { $sort: sort },
+    ...gameLookup,
+    ...userLookup,
+  ])
+    .allowDiskUse(true)
+    .cursor({ batchSize: 500 });
+};
+
+const flag = (v) => ["1", "true", "yes", "on"].includes(String(v ?? "").toLowerCase());
+
+// Streams CSV for the currently filtered payments; never buffers the full result set.
+// ?merge= reports merged aliases under one backend username; ?groupByUsername=1 orders rows by
+// payment method, then backend username (like the PDF).
 const exportCsv = async (req, res) => {
   const match = await buildPaymentFilter(req.query);
+  const merge = parseMerge(req.query.merge);
+  const byUsername = flag(req.query.groupByUsername);
   let columns = pickColumns(req.query.columns).filter((c) => c.inCsv !== false);
   if (!columns.length) columns = EXPORT_COLUMNS.filter((c) => c.inCsv !== false);
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="${exportFilename(req.query.filename, "csv")}"`);
   res.write(columns.map((c) => csvCell(c.label)).join(",") + "\n");
 
-  for await (const p of exportCursor(match)) {
+  for await (const p of exportCursor(match, { merge, byMethod: byUsername, byUsername })) {
+    p.gameUsername = p._group;
     const row = columns.map((c) => csvCell(cellOf(c, p, "csv")));
     if (!res.write(row.join(",") + "\n")) await new Promise((r) => res.once("drain", r));
   }
@@ -512,13 +580,20 @@ const money = (c) => {
   return (s.startsWith("-") ? "-$" : "$") + s.replace("-", "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 };
 
-// Count and totals per payment method, in section order
-const methodStats = async (match) => {
+const SUM_KEYS = ["count", "deposit", "loaded", "redeemed", "cashout"];
+const methodOrder = (m) => (m ? PAYMENT_METHODS.indexOf(m) : PAYMENT_METHODS.length);
+
+// Count and totals per payment method (in section order), and per backend-username group inside each
+// method (Map keyed "method|lowercase name"), with the distinct spellings combined into each group
+const exportStats = async (match, merge) => {
   const rows = await Payment.aggregate([
     { $match: match },
+    { $addFields: { _group: groupNameExpr(merge) } },
     {
       $group: {
-        _id: { $ifNull: ["$paymentMethod", ""] },
+        _id: { method: { $ifNull: ["$paymentMethod", ""] }, key: { $toLower: "$_group" } },
+        name: { $first: "$_group" },
+        spellings: { $addToSet: usernameExpr },
         count: { $sum: 1 },
         deposit: { $sum: "$deposit" },
         loaded: { $sum: "$loaded" },
@@ -527,29 +602,26 @@ const methodStats = async (match) => {
       },
     },
   ]);
-  const order = (m) => (m ? PAYMENT_METHODS.indexOf(m) : PAYMENT_METHODS.length);
-  return rows.sort((a, b) => order(a._id) - order(b._id));
+  const methods = new Map();
+  const groups = new Map();
+  for (const r of rows) {
+    const m = r._id.method;
+    groups.set(`${m}|${r._id.key}`, { name: r.name, spellings: r.spellings.filter(Boolean).sort(), ...Object.fromEntries(SUM_KEYS.map((k) => [k, r[k]])) });
+    const t = methods.get(m) || { _id: m, count: 0, deposit: 0, loaded: 0, redeemed: 0, cashout: 0 };
+    SUM_KEYS.forEach((k) => (t[k] += r[k]));
+    methods.set(m, t);
+  }
+  return { methods: [...methods.values()].sort((a, b) => methodOrder(a._id) - methodOrder(b._id)), groups };
 };
-
-// PDF order: grouped by payment method (PAYMENT_METHODS order, entries without one last), newest first in each group
-const pdfCursor = (match) =>
-  Payment.aggregate([
-    { $match: match },
-    { $addFields: { _methodOrder: { $indexOfArray: [PAYMENT_METHODS, { $ifNull: ["$paymentMethod", ""] }] } } },
-    { $addFields: { _methodOrder: { $cond: [{ $lt: ["$_methodOrder", 0] }, PAYMENT_METHODS.length, "$_methodOrder"] } } },
-    { $sort: { _methodOrder: 1, date: -1, _id: -1 } },
-    ...gameLookup,
-    ...userLookup,
-  ])
-    .allowDiskUse(true)
-    .cursor({ batchSize: 500 });
 
 // Streams a PDF report of the currently filtered payments (same filters as the list and CSV): summary
 // cards, one section per payment method with its subtotal, the grand total, then a page listing every
 // image link in full (the table itself only has small "Photo" / "Cashout" buttons)
 const exportPdf = async (req, res) => {
   const match = await buildPaymentFilter(req.query);
-  const stats = await methodStats(match);
+  const merge = parseMerge(req.query.merge);
+  const byUsername = flag(req.query.groupByUsername);
+  const [{ methods: stats, groups: groupStats }, overview] = await Promise.all([exportStats(match, merge), summaryTotals(match)]);
   let picked = pickColumns(req.query.columns).filter((c) => c.pdf !== false);
   if (!picked.length) picked = EXPORT_COLUMNS.filter((c) => c.pdf !== false);
   // Row number first: the Image Links page refers back to it
@@ -638,21 +710,56 @@ const exportPdf = async (req, res) => {
   });
   y += cardH + 10;
 
-  let chipX = left;
-  stats.forEach((s) => {
-    const label = `${methodTitle(s._id)}   ${entries(s.count)}  ·  ${money(s.deposit)}`;
-    doc.font("Helvetica").fontSize(8);
-    const w = doc.widthOfString(label) + 24;
-    if (chipX + w > left + pageWidth) {
-      chipX = left;
-      y += 22;
+  // ---- Overview: the same four panels as the user's dashboard (each total split by method or game) ----
+  const panels = [
+    { title: "Total Deposit", total: overview.totalDeposit, color: "#059669", rows: overview.depositByMethod.map((r) => ({ label: methodTitle(r.method || ""), amount: r.amount, dot: METHOD_COLORS[r.method || ""] })) },
+    { title: "Total Loaded", total: overview.totalLoaded, color: "#2563eb", rows: overview.loadedByGame.map((r) => ({ label: r.game || "Unknown game", amount: r.amount })) },
+    { title: "Total Redeemed", total: overview.totalRedeemed, color: "#7c3aed", rows: overview.redeemedByGame.map((r) => ({ label: r.game || "Unknown game", amount: r.amount })) },
+    { title: "Total Cashout", total: overview.totalCashout, color: "#d97706", rows: overview.cashoutByMethod.map((r) => ({ label: methodTitle(r.method || ""), amount: r.amount, dot: METHOD_COLORS[r.method || ""] })) },
+  ];
+  doc.fillColor(PDF.ink).font("Helvetica-Bold").fontSize(11).text("Overview", left, y, { lineBreak: false });
+  y += 17;
+  const PANEL_HEAD = 44;
+  const LINE_H = 14;
+  // Fit the panels on the first page: long lists keep their largest rows and sum the rest as "Other"
+  const maxLines = Math.max(3, Math.floor((bottom() - y - PANEL_HEAD - 60) / LINE_H));
+  const fitRows = (rows) => {
+    if (rows.length <= maxLines) return rows;
+    const kept = rows.slice(0, maxLines - 1);
+    const rest = rows.slice(maxLines - 1);
+    return [...kept, { label: `Other (${rest.length})`, amount: rest.reduce((s, r) => s + r.amount, 0), other: true }];
+  };
+  panels.forEach((pn) => (pn.rows = fitRows(pn.rows)));
+  const panelW = (pageWidth - gap * 3) / 4;
+  const panelH = PANEL_HEAD + Math.max(1, ...panels.map((pn) => pn.rows.length)) * LINE_H + 10;
+  panels.forEach((pn, i) => {
+    const px = left + i * (panelW + gap);
+    doc.save();
+    doc.roundedRect(px, y, panelW, panelH, 6).fillOpacity(0.06).fill(pn.color);
+    doc.restore();
+    doc.roundedRect(px, y, panelW, panelH, 6).lineWidth(0.75).strokeOpacity(0.5).stroke(pn.color);
+    doc.strokeOpacity(1);
+    doc.fillColor(pn.color).font("Helvetica-Bold").fontSize(7.5).text(pn.title.toUpperCase(), px + 10, y + 9, { width: panelW - 20, lineBreak: false });
+    doc.fillColor(PDF.ink).font("Helvetica-Bold").fontSize(14).text(money(pn.total), px + 10, y + 20, { width: panelW - 20, lineBreak: false, ellipsis: true });
+    const ly0 = y + PANEL_HEAD - 4;
+    doc.moveTo(px + 10, ly0).lineTo(px + panelW - 10, ly0).lineWidth(0.5).strokeColor(pn.color).strokeOpacity(0.3).stroke();
+    doc.strokeOpacity(1);
+    if (!pn.rows.length) {
+      doc.fillColor(PDF.faint).font("Helvetica").fontSize(8).text("None", px + 10, ly0 + 6, { lineBreak: false });
     }
-    doc.roundedRect(chipX, y, w, 17, 8.5).lineWidth(0.75).fillAndStroke("#ffffff", PDF.line);
-    doc.circle(chipX + 10, y + 8.5, 3.2).fill(METHOD_COLORS[s._id] || PDF.muted);
-    doc.fillColor(PDF.ink).font("Helvetica").fontSize(8).text(label, chipX + 17, y + 5, { lineBreak: false });
-    chipX += w + 6;
+    pn.rows.forEach((r, j) => {
+      const ly = ly0 + 5 + j * LINE_H;
+      let tx = px + 10;
+      if (r.dot) {
+        doc.circle(px + 13, ly + 4, 2.6).fill(r.dot);
+        tx += 9;
+      }
+      const amountW = 70;
+      doc.fillColor(r.other ? PDF.muted : PDF.ink).font("Helvetica").fontSize(8.5).text(r.label, tx, ly, { width: px + panelW - 10 - amountW - tx, lineBreak: false, ellipsis: true });
+      doc.fillColor(r.amount ? PDF.ink : PDF.faint).font("Helvetica-Bold").fontSize(8.5).text(money(r.amount), px + panelW - 10 - amountW, ly, { width: amountW, align: "right", lineBreak: false });
+    });
   });
-  y += 30;
+  y += panelH + 22;
 
   if (!stats.length) {
     doc.fillColor(PDF.muted).font("Helvetica").fontSize(11).text("No entries match these filters.", left, y, { width: pageWidth, align: "center" });
@@ -749,41 +856,86 @@ const exportPdf = async (req, res) => {
     y += ROW_H;
   };
 
+  // Backend-username sub-heading inside a method section (?groupByUsername=1)
+  let userGroup = null; // { key, stat } being drawn
+  const GROUP_H = 20;
+  const groupHeading = (continued = false) => {
+    const color = METHOD_COLORS[section.method] || PDF.muted;
+    const s = userGroup.stat;
+    doc.rect(left, y, pageWidth, GROUP_H).fill("#eef2f7");
+    doc.rect(left, y, 2.5, GROUP_H).fill(color);
+    const title = `Backend: ${s.name || "(none)"}${continued ? "  (continued)" : ""}`;
+    doc.font("Helvetica-Bold").fontSize(9.5);
+    const tw = Math.min(doc.widthOfString(title), pageWidth / 2 - 20);
+    doc.fillColor(PDF.ink).text(title, left + 10, y + 6, { width: pageWidth / 2 - 10, lineBreak: false, ellipsis: true });
+    // Aliases (merged names or case variants) combined under this name
+    if (s.spellings.some((n) => n !== s.name)) {
+      doc
+        .fillColor(PDF.muted)
+        .font("Helvetica")
+        .fontSize(7.5)
+        .text(`merged: ${s.spellings.join(", ")}`, left + 18 + tw, y + 7.5, { width: Math.max(pageWidth / 2 - tw - 24, 10), lineBreak: false, ellipsis: true });
+    }
+    const summary = `${entries(s.count)}   ·   Deposit ${money(s.deposit)}   ·   Loaded ${money(s.loaded)}`;
+    doc.fillColor(PDF.muted).font("Helvetica").fontSize(8).text(summary, left + pageWidth / 2, y + 6.5, { width: pageWidth / 2 - 10, align: "right", lineBreak: false });
+    y += GROUP_H;
+  };
+
   onNewPage = () => {
     if (section) sectionHeading(true);
     tableHeader();
+    if (section && userGroup) groupHeading(true);
   };
 
   let no = 0;
   let groupCount = 0;
   let groupSums = zeroSums();
+  let userCount = 0;
+  let userSums = zeroSums();
   const totals = zeroSums();
+  const closeUserGroup = () => {
+    if (userGroup) sumRow(`${userGroup.stat.name || "(none)"} subtotal`, userCount, userSums);
+    userGroup = null;
+  };
   const closeSection = () => {
+    closeUserGroup();
     if (section) sumRow(`${methodTitle(section.method)} subtotal`, groupCount, groupSums);
     section = null;
   };
 
-  for await (const p of pdfCursor(match)) {
+  // Grouped by payment method (PAYMENT_METHODS order, entries without one last), then optionally by
+  // backend username; newest first in each group
+  for await (const p of exportCursor(match, { merge, byMethod: true, byUsername })) {
     const method = p.paymentMethod || "";
     if (!section || section.method !== method) {
       closeSection();
       if (no) y += 14;
       // Keep the heading with its table header and first rows
-      ensureRoom(SECTION_H + 4 + ROW_H * 3);
+      ensureRoom(SECTION_H + 4 + ROW_H * 3 + (byUsername ? GROUP_H : 0));
       section = { method, stat: stats.find((s) => s._id === method) || { count: 0, deposit: 0, loaded: 0 } };
       groupCount = 0;
       groupSums = zeroSums();
       sectionHeading();
       tableHeader();
     }
+    if (byUsername && (!userGroup || userGroup.key !== p._groupKey)) {
+      closeUserGroup();
+      ensureRoom(GROUP_H + ROW_H * 2);
+      userGroup = { key: p._groupKey, stat: groupStats.get(`${method}|${p._groupKey}`) || { name: p._group, spellings: [], count: 0, deposit: 0, loaded: 0 } };
+      userCount = 0;
+      userSums = zeroSums();
+      groupHeading();
+    }
     ensureRoom(ROW_H);
     no += 1;
     groupCount += 1;
+    userCount += 1;
     moneyCols.forEach((c) => {
       totals[c.key] += c.value(p);
       groupSums[c.key] += c.value(p);
+      userSums[c.key] += c.value(p);
     });
-    dataRow(p, no, groupCount % 2 === 0);
+    dataRow(p, no, (byUsername ? userCount : groupCount) % 2 === 0);
   }
   closeSection();
   onNewPage = tableHeader;

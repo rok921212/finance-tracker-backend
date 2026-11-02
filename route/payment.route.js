@@ -12,6 +12,7 @@ const {
   mySummary,
   getMyPayment,
   deleteMyPayment,
+  myGameUsernames,
 } = require("../controllers/payment.controller.js");
 
 const router = express.Router();
@@ -32,6 +33,7 @@ router.post("/", createLimiter, uploadScreenshot, asyncHandler(createPayment));
 router.get("/", asyncHandler(listMyPayments));
 router.get("/summary", asyncHandler(mySummary));
 router.get("/changes", asyncHandler(myChanges));
+router.get("/game-usernames", asyncHandler(myGameUsernames));
 router.get("/:id", asyncHandler(getMyPayment));
 router.patch("/:id", createLimiter, uploadOptionalScreenshot, asyncHandler(updatePayment));
 router.delete("/:id", asyncHandler(deleteMyPayment));

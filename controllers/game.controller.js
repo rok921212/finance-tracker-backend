@@ -5,6 +5,8 @@ const { HttpError } = require("../utils/httpError.js");
 const { toObjectId } = require("../utils/validation.js");
 const { sendCached, bump, deps } = require("../services/cache.js");
 const cloud = require("../services/cloudinary.js");
+const Payment = require("../models/payment.model.js");
+const GameCredential = require("../models/gameCredential.model.js");
 
 // Public (authenticated) list used by the Add Entry dropdown: active games only
 // Cached in Redis until a game changes; the browser always revalidates (a cheap 304 via ETag)
@@ -152,4 +154,37 @@ const removeGameImage = async (req, res) => {
   res.json(toAdminGame(game));
 };
 
-module.exports = { listActiveGames, listPublicGames, adminListGames, createGame, updateGame, moveGame, uploadGameImage, removeGameImage };
+// Permanently delete a game. Only allowed while no entry uses it (entries keep their game forever, so
+// a game with history can only be disabled). Its saved backend logins and image go with it.
+const deleteGame = async (req, res) => {
+  const id = toObjectId(req.params.id, "game id");
+  const game = await Game.findById(id);
+  if (!game) throw new HttpError(404, "Game not found", "NOT_FOUND");
+  const entries = await Payment.countDocuments({ gameId: id });
+  if (entries) {
+    throw new HttpError(
+      409,
+      `"${game.name}" has ${entries} ${entries === 1 ? "entry" : "entries"} and can't be deleted. Disable it instead to hide it from new entries.`,
+      "GAME_IN_USE",
+      { entries }
+    );
+  }
+  const image = game.image && game.image.publicId;
+  const { deletedCount: logins } = await GameCredential.deleteMany({ gameId: id });
+  await game.deleteOne();
+  if (image && !(await Game.exists({ "image.publicId": image }))) cloud.destroy(image).catch(() => {});
+  await Promise.all([AuditLog.record(req.userId, "game.delete", "game", id, { name: game.name, logins }), bump(deps.games)]);
+  res.json({ message: "Game deleted", id });
+};
+
+module.exports = {
+  listActiveGames,
+  listPublicGames,
+  adminListGames,
+  createGame,
+  updateGame,
+  moveGame,
+  uploadGameImage,
+  removeGameImage,
+  deleteGame,
+};

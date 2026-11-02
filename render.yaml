@@ -13,7 +13,7 @@ services:
         value: production
       # Set these as secrets in the Render dashboard:
       # MONGO_URI, JWT_SECRET, REGISTER_CODE, FRONTEND_ORIGINS,
-      # CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET,
+      # CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CREDENTIALS_KEY,
       # ADMIN_USERNAME, ADMIN_PASSWORD (only needed when running `npm run seed`)
       # Redis cache (REDIS_URL or UPSTASH_REDIS_REST_URL/_TOKEN): set the eviction policy to
       # `volatile-lru`, so memory pressure only evicts cached bodies (they have a TTL) and never the

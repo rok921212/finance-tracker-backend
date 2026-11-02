@@ -63,6 +63,9 @@ app.use(
     maxAge: 7200,
   })
 );
+// cors() answers allowed preflights itself; a rejected one would otherwise fall through to the
+// routers and surface as a misleading 401 from the auth middleware
+app.options(/.*/, (req, res) => res.status(403).json({ message: "Origin not allowed", code: "CORS_ORIGIN" }));
 app.use(express.json({ limit: "100kb" }));
 app.use("/api", (req, res, next) => {
   res.set("Cache-Control", "no-store");

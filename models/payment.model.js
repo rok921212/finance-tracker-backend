@@ -58,6 +58,8 @@ const paymentSchema = new mongoose.Schema(
 paymentSchema.index({ userId: 1, date: -1 });
 paymentSchema.index({ gameId: 1, date: -1 });
 paymentSchema.index({ date: -1 });
+// Backend-username suggestions on the entry form
+paymentSchema.index({ userId: 1, gameUsername: 1 });
 // Dedup / reuse lookups by image hash. Partial: entries without that image take no index space
 const hasField = (field) => ({ partialFilterExpression: { [field]: { $exists: true } } });
 paymentSchema.index({ screenshotHash: 1 }, hasField("screenshotHash"));

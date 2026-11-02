@@ -62,6 +62,7 @@ const run = async () => {
     require("../models/auditLog.model.js").syncIndexes(),
     require("../models/booking.model.js").syncIndexes(),
     require("../models/deletedPayment.model.js").syncIndexes(),
+    require("../models/gameCredential.model.js").syncIndexes(),
   ]);
   // Games may have changed outside the API: invalidate cached game lists
   await require("../services/cache.js").bump("games");

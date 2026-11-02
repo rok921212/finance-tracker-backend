@@ -7,6 +7,7 @@ const games = require("../controllers/game.controller.js");
 const banner = require("../controllers/banner.controller.js");
 const tags = require("../controllers/tag.controller.js");
 const wheel = require("../controllers/wheel.controller.js");
+const credentials = require("../controllers/gameCredential.controller.js");
 const { uploadSingleImage } = require("../middleware/uploadImage.js");
 
 const router = express.Router();
@@ -36,9 +37,18 @@ router.get("/games", asyncHandler(games.adminListGames));
 router.get("/games/summary", asyncHandler(admin.gamesSummary));
 router.post("/games", asyncHandler(games.createGame));
 router.patch("/games/:id", asyncHandler(games.updateGame));
+router.delete("/games/:id", asyncHandler(games.deleteGame));
 router.post("/games/:id/move", asyncHandler(games.moveGame));
 router.post("/games/:id/image", uploadSingleImage("image"), asyncHandler(games.uploadGameImage));
 router.delete("/games/:id/image", asyncHandler(games.removeGameImage));
+
+// Backend logins per game (passwords encrypted; only returned by reveal)
+router.get("/games/credential-counts", asyncHandler(credentials.credentialCounts));
+router.get("/games/:id/credentials", asyncHandler(credentials.listCredentials));
+router.post("/games/:id/credentials", asyncHandler(credentials.createCredential));
+router.patch("/games/:id/credentials/:credId", asyncHandler(credentials.updateCredential));
+router.delete("/games/:id/credentials/:credId", asyncHandler(credentials.deleteCredential));
+router.post("/games/:id/credentials/:credId/reveal", asyncHandler(credentials.revealCredential));
 
 router.get("/banner", asyncHandler(banner.adminGetBanner));
 router.post("/banner", uploadSingleImage("image"), asyncHandler(banner.adminUploadBanner));

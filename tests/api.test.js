@@ -1401,6 +1401,19 @@ describe("user list sorting and player filter", () => {
     expect(players(await list("sort=player&order=desc"))[0]).toBe("superman2");
   });
 
+  test("sorts by backend username (ignoring case) and by payment method", async () => {
+    const setup = { Superman: ["zeta", "venmo"], SUPERMAN: ["Alpha", "zelle"], superman2: ["beta", "cashapp"], batman: ["Gamma", "chime"] };
+    for (const [player, [gameUsername, paymentMethod]] of Object.entries(setup)) {
+      await Payment.updateOne({ userId: sorter.id, player }, { $set: { gameUsername, paymentMethod } });
+    }
+    const users = (res) => res.body.items.map((i) => i.gameUsername);
+    expect(users(await list("sort=gameUsername"))).toEqual(["Alpha", "beta", "Gamma", "zeta"]);
+    expect(users(await list("sort=gameUsername&order=desc"))).toEqual(["zeta", "Gamma", "beta", "Alpha"]);
+    const methods = (res) => res.body.items.map((i) => i.paymentMethod);
+    expect(methods(await list("sort=paymentMethod"))).toEqual(["cashapp", "chime", "venmo", "zelle"]);
+    expect(methods(await list("sort=paymentMethod&order=desc"))).toEqual(["zelle", "venmo", "chime", "cashapp"]);
+  });
+
   test("player filter matches the exact name in any case, not longer names", async () => {
     const res = await list("player=superman&sort=deposit");
     expect(res.status).toBe(200);
@@ -1640,5 +1653,152 @@ describe("admin user management: edit, password reset, delete", () => {
     expect((await request(app).get("/api/payments/summary").set(auth(gina.token))).status).toBe(401);
     expect(await AuditLog.countDocuments({ action: "user.delete", targetId: gina.id })).toBe(1);
     expect((await request(app).delete(`/api/admin/users/${gina.id}`).set(auth(adminTok))).status).toBe(404);
+  });
+});
+
+describe("export merging and grouping by backend username", () => {
+  test("merged aliases are reported under one name; grouped CSV order; invalid merge is 400", async () => {
+    const entries = [
+      { gameUsername: "mergeJohn1", paymentMethod: "venmo", deposit: "10" },
+      { gameUsername: "MergeJohn_1", paymentMethod: "venmo", deposit: "20" },
+      { gameUsername: "mergeAmy", paymentMethod: "venmo", deposit: "5" },
+      { gameUsername: "mergejohn1", paymentMethod: "cashapp", deposit: "7" },
+    ];
+    const ids = [];
+    for (const [i, e] of entries.entries()) {
+      const r = await submit(userA.token, { date: "2026-09-25", loaded: "5", gameId: fireKirin._id, ...e }, avif(9700 + i));
+      expect([r.status, r.body.code]).toEqual([201, undefined]);
+      ids.push(r.body.payment.id);
+    }
+    const merge = encodeURIComponent(JSON.stringify([{ name: "John", members: ["mergejohn1", "MERGEJOHN_1"] }]));
+    const base = "/api/admin/payments/export.csv?dateFrom=2026-09-25&dateTo=2026-09-25&columns=paymentMethod,gameUsername,deposit";
+
+    const csv = await request(app).get(`${base}&merge=${merge}&groupByUsername=1`).set(auth(adminTok));
+    expect(csv.status).toBe(200);
+    // Method order (cashapp before venmo), then backend username, then newest first
+    expect(csv.text.trim().split("\n").slice(1)).toEqual(["John,cashapp,7.00", "John,venmo,20.00", "John,venmo,10.00", "mergeAmy,venmo,5.00"]);
+
+    // Without merge the stored spellings are kept
+    const plain = await request(app).get(base).set(auth(adminTok));
+    expect(plain.text).toContain("MergeJohn_1");
+
+    const pdf = await request(app).get(`/api/admin/payments/export.pdf?dateFrom=2026-09-25&dateTo=2026-09-25&merge=${merge}&groupByUsername=1`).set(auth(adminTok));
+    expect(pdf.status).toBe(200);
+    expect(pdf.headers["content-type"]).toBe("application/pdf");
+
+    expect((await request(app).get(`${base}&merge=not-json`).set(auth(adminTok))).status).toBe(400);
+    expect((await request(app).get(`${base}&merge=${encodeURIComponent('[{"name":"","members":[]}]')}`).set(auth(adminTok))).status).toBe(400);
+
+    for (const id of ids) await request(app).delete(`/api/admin/payments/${id}`).set(auth(adminTok));
+  });
+});
+
+describe("backend username suggestions", () => {
+  test("only the caller's own names, case variants merged, optionally per game", async () => {
+    const [g1, g2] = await Game.create([{ name: "Suggest One", slug: "suggest-one" }, { name: "Suggest Two", slug: "suggest-two" }]);
+    const ids = [];
+    for (const [i, [tok, name, game]] of [
+      [userA.token, "suggestA", g1],
+      [userA.token, "SUGGESTA", g1],
+      [userA.token, "suggestFk", g2],
+      [userB.token, "suggestBob", g1],
+    ].entries()) {
+      const r = await submit(tok, { date: "2026-09-26", deposit: "1", loaded: "1", gameId: game._id, gameUsername: name }, avif(9800 + i));
+      expect([r.status, r.body.code]).toEqual([201, undefined]);
+      ids.push(r.body.payment.id);
+    }
+    const all = await request(app).get("/api/payments/game-usernames").set(auth(userA.token));
+    expect(all.status).toBe(200);
+    const names = all.body.map((n) => n.name);
+    expect(names).toContain("SUGGESTA"); // latest spelling wins
+    expect(names).not.toContain("suggestA");
+    expect(names).toContain("suggestFk");
+    expect(names).not.toContain("suggestBob");
+    expect(all.body.find((n) => n.name === "SUGGESTA").count).toBe(2);
+
+    const perGame = await request(app).get(`/api/payments/game-usernames?gameId=${g1._id}`).set(auth(userA.token));
+    expect(perGame.body.map((n) => n.name)).not.toContain("suggestFk");
+    expect((await request(app).get("/api/payments/game-usernames")).status).toBe(401);
+
+    for (const id of ids) await request(app).delete(`/api/admin/payments/${id}`).set(auth(adminTok));
+  });
+});
+
+describe("game backend logins", () => {
+  const GameCredential = require("../models/gameCredential.model.js");
+
+  test("admin CRUD with encrypted passwords, reveal is audited, users are blocked", async () => {
+    const path = `/api/admin/games/${juwa._id}/credentials`;
+    expect((await request(app).get(path).set(auth(userA.token))).status).toBe(403);
+    expect((await request(app).post(path).set(auth(adminTok)).send({ username: "x" })).status).toBe(400);
+
+    const a = await request(app).post(path).set(auth(adminTok)).send({ label: "Main", username: "juwa_agent", password: "s3cret pw", notes: "store 1" });
+    expect(a.status).toBe(201);
+    const b = await request(app).post(path).set(auth(adminTok)).send({ username: "juwa_agent2", password: "other" });
+    expect(b.status).toBe(201);
+
+    // Stored encrypted, never in the list
+    const stored = await GameCredential.findById(a.body.id).lean();
+    expect(JSON.stringify(stored)).not.toContain("s3cret pw");
+    const list = await request(app).get(path).set(auth(adminTok));
+    expect(list.headers["cache-control"]).toBe("no-store");
+    expect(list.body.map((c) => c.username)).toEqual(["juwa_agent", "juwa_agent2"]);
+    expect(JSON.stringify(list.body)).not.toContain("password");
+
+    const counts = await request(app).get("/api/admin/games/credential-counts").set(auth(adminTok));
+    expect(counts.body[String(juwa._id)]).toBe(2);
+
+    const reveal = await request(app).post(`${path}/${a.body.id}/reveal`).set(auth(adminTok));
+    expect(reveal.body.password).toBe("s3cret pw");
+    expect(await AuditLog.countDocuments({ action: "credential.reveal", targetId: a.body.id })).toBe(1);
+    expect((await request(app).post(`${path}/${a.body.id}/reveal`).set(auth(userA.token))).status).toBe(403);
+
+    // Blank password keeps the current one
+    const upd = await request(app).patch(`${path}/${a.body.id}`).set(auth(adminTok)).send({ label: "Primary", password: "" });
+    expect(upd.body.label).toBe("Primary");
+    expect((await request(app).post(`${path}/${a.body.id}/reveal`).set(auth(adminTok))).body.password).toBe("s3cret pw");
+    await request(app).patch(`${path}/${a.body.id}`).set(auth(adminTok)).send({ password: "newpass" });
+    expect((await request(app).post(`${path}/${a.body.id}/reveal`).set(auth(adminTok))).body.password).toBe("newpass");
+
+    // Scoped to the game in the URL
+    expect((await request(app).post(`/api/admin/games/${fireKirin._id}/credentials/${a.body.id}/reveal`).set(auth(adminTok))).status).toBe(404);
+
+    // Admin / game links: http(s) only, a bare domain gets https://, blank clears
+    expect(b.body.adminUrl).toBe("");
+    const links = await request(app)
+      .patch(`${path}/${b.body.id}`)
+      .set(auth(adminTok))
+      .send({ adminUrl: "agent.juwa.example/admin", gameUrl: "http://play.juwa.example" });
+    expect(links.body.adminUrl).toBe("https://agent.juwa.example/admin");
+    expect(links.body.gameUrl).toBe("http://play.juwa.example");
+    expect((await request(app).get(path).set(auth(adminTok))).body[1].gameUrl).toBe("http://play.juwa.example");
+    expect((await request(app).patch(`${path}/${b.body.id}`).set(auth(adminTok)).send({ adminUrl: "javascript:alert(1)" })).status).toBe(400);
+    expect((await request(app).post(path).set(auth(adminTok)).send({ username: "u", password: "p", gameUrl: "ftp://x.example" })).status).toBe(400);
+    expect((await request(app).patch(`${path}/${b.body.id}`).set(auth(adminTok)).send({ gameUrl: "" })).body.gameUrl).toBe("");
+
+    for (const c of [a, b]) expect((await request(app).delete(`${path}/${c.body.id}`).set(auth(adminTok))).status).toBe(200);
+    expect((await request(app).get(path).set(auth(adminTok))).body).toEqual([]);
+  });
+
+  test("a game without entries can be deleted (its logins too); one with entries cannot", async () => {
+    const created = await request(app).post("/api/admin/games").set(auth(adminTok)).send({ name: "Temp Delete Game" });
+    expect(created.status).toBe(201);
+    const id = created.body.id;
+    await request(app).post(`/api/admin/games/${id}/credentials`).set(auth(adminTok)).send({ username: "tmp", password: "p" });
+    expect((await request(app).delete(`/api/admin/games/${id}`).set(auth(userA.token))).status).toBe(403);
+
+    const del = await request(app).delete(`/api/admin/games/${id}`).set(auth(adminTok));
+    expect(del.status).toBe(200);
+    expect(await Game.exists({ _id: id })).toBeNull();
+    expect(await GameCredential.countDocuments({ gameId: id })).toBe(0);
+    expect(await AuditLog.countDocuments({ action: "game.delete", targetId: id })).toBe(1);
+    expect((await request(app).delete(`/api/admin/games/${id}`).set(auth(adminTok))).status).toBe(404);
+
+    // A game with history keeps it: only disabling is allowed
+    const used = await Payment.findOne().select("gameId").lean();
+    const blocked = await request(app).delete(`/api/admin/games/${used.gameId}`).set(auth(adminTok));
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.code).toBe("GAME_IN_USE");
+    expect(await Game.exists({ _id: used.gameId })).toBeTruthy();
   });
 });

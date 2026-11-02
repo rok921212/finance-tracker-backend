@@ -361,7 +361,9 @@ const updatePayment = async (req, res) => {
   res.json({ message: "Entry updated", payment: await myPaymentDetail(userId, id) });
 };
 
-const MY_SORTS = ["date", "deposit", "loaded", "redeemed", "cashout", "player"];
+const MY_SORTS = ["date", "deposit", "loaded", "redeemed", "cashout", "player", "gameUsername", "paymentMethod"];
+// Text sorts: A-Z by default, ignoring case
+const TEXT_SORTS = ["player", "gameUsername", "paymentMethod"];
 // Player names compare case-insensitively (sort order and filter)
 const CASE_INSENSITIVE = { locale: "en", strength: 2 };
 
@@ -371,16 +373,16 @@ const myPlayerMatch = (query) => {
   return player ? { player: { $regex: "^" + escapeRegex(player) + "$", $options: "i" } } : {};
 };
 
-// ?sort=deposit|loaded|redeemed|cashout|player|date &order=asc|desc (default: newest first; player A-Z)
+// ?sort=deposit|loaded|redeemed|cashout|player|gameUsername|paymentMethod|date &order=asc|desc (default: newest first; text A-Z)
 const myListOptions = (query) => {
   const sort = query.sort ? String(query.sort) : "date";
   if (!MY_SORTS.includes(sort)) throw new HttpError(400, "Invalid sort", "INVALID_SORT");
   if (query.order && !["asc", "desc"].includes(query.order)) throw new HttpError(400, "Invalid order", "INVALID_ORDER");
-  const order = query.order || (sort === "player" ? "asc" : "desc");
+  const order = query.order || (TEXT_SORTS.includes(sort) ? "asc" : "desc");
   const dir = order === "asc" ? 1 : -1;
   // Ties (and the default view) fall back to newest first
   const $sort = sort === "date" ? { date: dir, _id: dir } : { [sort]: dir, date: -1, _id: -1 };
-  return { $sort, collation: sort === "player" ? CASE_INSENSITIVE : undefined };
+  return { $sort, collation: TEXT_SORTS.includes(sort) ? CASE_INSENSITIVE : undefined };
 };
 
 const listMyPayments = async (req, res) => {
@@ -508,9 +510,36 @@ const getMyPayment = async (req, res) => {
   await sendCached(req, res, opts, () => myPaymentDetail(userId, id));
 };
 
+// Backend usernames this user entered before (case variants merged, latest spelling kept), most
+// recently used first; optionally only for one game. Feeds the entry form's suggestions.
+const myGameUsernames = async (req, res) => {
+  const userId = toObjectId(req.userId, "user");
+  const match = { userId, userDeletedAt: null, gameUsername: { $nin: [null, ""] } };
+  if (req.query.gameId) match.gameId = toObjectId(req.query.gameId, "gameId");
+  const opts = { name: "my-game-usernames", deps: [deps.userPayments(userId)], scope: `${userId}:${match.gameId || ""}` };
+  await sendCached(req, res, opts, async () => {
+    const rows = await Payment.aggregate([
+      { $match: match },
+      { $sort: { createdAt: -1 } },
+      {
+        $group: {
+          _id: { $toLower: "$gameUsername" },
+          name: { $first: "$gameUsername" },
+          count: { $sum: 1 },
+          lastUsed: { $first: "$createdAt" },
+        },
+      },
+      { $sort: { lastUsed: -1, _id: 1 } },
+      { $limit: 200 },
+    ]);
+    return rows.map((r) => ({ name: r.name, count: r.count, lastUsed: r.lastUsed }));
+  });
+};
+
 module.exports = {
   createPayment,
   updatePayment,
+  myGameUsernames,
   deleteMyPayment,
   listMyPayments,
   myChanges,
