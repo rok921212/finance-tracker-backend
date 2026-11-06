@@ -6,14 +6,14 @@ const User = require("../models/user.model.js");
 const AuditLog = require("../models/auditLog.model.js");
 const cloud = require("../services/cloudinary.js");
 const { HttpError } = require("../utils/httpError.js");
-const { toObjectId, escapeRegex, parsePagination, pageResult } = require("../utils/validation.js");
+const { toObjectId, escapeRegex, parsePagination, parseOrder, pageResult } = require("../utils/validation.js");
 const { buildPaymentFilter, listParam } = require("../utils/paymentFilters.js");
-const { toListItem, gameLookup, cleanupAssets, summaryTotals } = require("./payment.controller.js");
+const { toListItem, gameLookup, cleanupAssets, cleanupLater, summaryTotals, myFilterMatch } = require("./payment.controller.js");
 const DeletedPayment = require("../models/deletedPayment.model.js");
 const PaymentEdit = require("../models/paymentEdit.model.js");
 const BookingData = require("../models/booking.model.js");
 const PDFDocument = require("pdfkit");
-const { sendCached, bump, deps } = require("../services/cache.js");
+const { sendCached, bump, deps, formatVersions } = require("../services/cache.js");
 const { listProject, syncToken, sendChanges } = require("../utils/delta.js");
 
 // Admin table thumbnails are shown at 32-40px, so an 80px image is plenty
@@ -63,6 +63,7 @@ const summary = async (req, res) => {
 };
 
 const listPayments = async (req, res) => {
+  const dir = parseOrder(req.query);
   const opts = { name: "admin-payments", deps: [deps.payments, deps.games, deps.users] };
   await sendCached(req, res, opts, async () => {
     const sync = await syncToken(deps.payments); // read before querying
@@ -71,7 +72,7 @@ const listPayments = async (req, res) => {
     const [items, total] = await Promise.all([
       Payment.aggregate([
         { $match: match },
-        { $sort: { date: -1, _id: -1 } },
+        { $sort: { date: dir, _id: dir } },
         { $skip: pg.skip },
         { $limit: pg.limit },
         listProject,
@@ -135,28 +136,35 @@ const deletePayment = async (req, res) => {
   // Tombstone before the version bump, so a client syncing in between can't miss the delete
   await DeletedPayment.create({ paymentId: p._id, userId: p.userId });
   await PaymentEdit.deleteMany({ paymentId: p._id });
-  await bump(deps.payments, deps.userPayments(p.userId));
-  await AuditLog.record(adminId, "payment.delete", "payment", id, {
-    userId: p.userId,
-    gameId: p.gameId,
-    date: p.date,
-    deposit: p.deposit,
-    loaded: p.loaded,
-    redeemed: p.redeemed || 0,
-    edited: !!p.editedAt,
-    userDeleted: !!p.userDeletedAt,
-  });
+  const [versions] = await Promise.all([
+    bump(deps.payments, deps.userPayments(p.userId)),
+    AuditLog.record(adminId, "payment.delete", "payment", id, {
+      userId: p.userId,
+      gameId: p.gameId,
+      date: p.date,
+      deposit: p.deposit,
+      loaded: p.loaded,
+      redeemed: p.redeemed || 0,
+      edited: !!p.editedAt,
+      userDeleted: !!p.userDeletedAt,
+    }),
+  ]);
   // Images no other payment uses any more
-  await cleanupAssets([
+  cleanupLater([
     p.screenshot && { publicId: p.screenshot.publicId, field: "screenshot" },
     p.cashoutProof && { publicId: p.cashoutProof.publicId, field: "cashoutProof" },
   ]);
+  res.set("X-Data-Versions", formatVersions(versions));
   res.json({ message: "Entry permanently deleted", id });
 };
 
 // Users page: paginate users first, then aggregate only that page's payments (uses userId index)
 const listUsers = async (req, res) => {
   const pg = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
+  // A-Z by default; ?sort=createdAt&order=asc|desc sorts by join date
+  if (req.query.sort && req.query.sort !== "createdAt") throw new HttpError(400, "Invalid sort", "INVALID_SORT");
+  const dir = parseOrder(req.query);
+  const $sort = req.query.sort ? { createdAt: dir, _id: dir } : { username: 1 };
   const match = {};
   if (req.query.search && String(req.query.search).trim()) {
     match.username = { $regex: escapeRegex(String(req.query.search).trim().slice(0, 30)), $options: "i" };
@@ -165,7 +173,7 @@ const listUsers = async (req, res) => {
     const [users, total] = await Promise.all([
       User.aggregate([
         { $match: match },
-        { $sort: { username: 1 } },
+        { $sort },
         { $skip: pg.skip },
         { $limit: pg.limit },
         {
@@ -503,6 +511,36 @@ const parseMerge = (raw) => {
   return groups;
 };
 
+const MAX_EXCLUDE_RULES = 100;
+
+// ?exclude=[{"name":"john1","methods":["cashapp"]},{"name":"amy"}] -> a condition leaving those entries out.
+// Names match the stored backend username, ignoring case; no methods means every method.
+const parseExclude = (raw) => {
+  if (raw == null || String(raw).trim() === "") return {};
+  let data;
+  try {
+    data = JSON.parse(String(raw));
+  } catch {
+    throw new HttpError(400, "exclude must be valid JSON", "INVALID_EXCLUDE");
+  }
+  if (!Array.isArray(data) || data.length > MAX_EXCLUDE_RULES) {
+    throw new HttpError(400, `exclude must be a list of at most ${MAX_EXCLUDE_RULES} rules`, "INVALID_EXCLUDE");
+  }
+  const rules = data.map((r) => {
+    const name = String(r && r.name != null ? r.name : "").trim();
+    if (!name || name.length > 60) throw new HttpError(400, "Each exclude rule needs a name of 1-60 characters", "INVALID_EXCLUDE");
+    const methods = r.methods ?? [];
+    if (!Array.isArray(methods) || methods.some((m) => !PAYMENT_METHODS.includes(m))) {
+      throw new HttpError(400, "Each exclude rule needs valid payment methods", "INVALID_EXCLUDE");
+    }
+    return {
+      gameUsername: new RegExp("^" + escapeRegex(name) + "$", "i"),
+      ...(methods.length ? { paymentMethod: { $in: methods } } : {}),
+    };
+  });
+  return rules.length ? { $nor: rules } : {};
+};
+
 const usernameExpr = { $ifNull: ["$gameUsername", ""] };
 // The (possibly merged) backend username an entry is reported under
 const groupNameExpr = (groups) =>
@@ -580,6 +618,9 @@ const money = (c) => {
   return (s.startsWith("-") ? "-$" : "$") + s.replace("-", "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 };
 
+// Points loaded or redeemed: the same figure without the currency sign
+const points = (c) => money(c).replace("$", "");
+
 const SUM_KEYS = ["count", "deposit", "loaded", "redeemed", "cashout"];
 const methodOrder = (m) => (m ? PAYMENT_METHODS.indexOf(m) : PAYMENT_METHODS.length);
 
@@ -604,30 +645,51 @@ const exportStats = async (match, merge) => {
   ]);
   const methods = new Map();
   const groups = new Map();
+  const usernames = new Map(); // totals per backend username across every method
   for (const r of rows) {
     const m = r._id.method;
     groups.set(`${m}|${r._id.key}`, { name: r.name, spellings: r.spellings.filter(Boolean).sort(), ...Object.fromEntries(SUM_KEYS.map((k) => [k, r[k]])) });
     const t = methods.get(m) || { _id: m, count: 0, deposit: 0, loaded: 0, redeemed: 0, cashout: 0 };
     SUM_KEYS.forEach((k) => (t[k] += r[k]));
     methods.set(m, t);
+    const u = usernames.get(r._id.key) || { key: r._id.key, name: r.name, count: 0, deposit: 0, loaded: 0, redeemed: 0, cashout: 0 };
+    SUM_KEYS.forEach((k) => (u[k] += r[k]));
+    usernames.set(r._id.key, u);
   }
-  return { methods: [...methods.values()].sort((a, b) => methodOrder(a._id) - methodOrder(b._id)), groups };
+  return {
+    methods: [...methods.values()].sort((a, b) => methodOrder(a._id) - methodOrder(b._id)),
+    groups,
+    usernames: [...usernames.values()].sort((a, b) => a.key.localeCompare(b.key)),
+  };
 };
 
-// Streams a PDF report of the currently filtered payments (same filters as the list and CSV): summary
-// cards, one section per payment method with its subtotal, the grand total, then a page listing every
-// image link in full (the table itself only has small "Photo" / "Cashout" buttons)
+// Admin PDF of the currently filtered payments (same filters as the list and CSV)
 const exportPdf = async (req, res) => {
-  const match = await buildPaymentFilter(req.query);
-  const merge = parseMerge(req.query.merge);
-  const byUsername = flag(req.query.groupByUsername);
-  const [{ methods: stats, groups: groupStats }, overview] = await Promise.all([exportStats(match, merge), summaryTotals(match)]);
+  // ?exclude= leaves entries out of every part of the report: totals, sections, rows and image links
+  const match = { ...(await buildPaymentFilter(req.query)), ...parseExclude(req.query.exclude) };
   let picked = pickColumns(req.query.columns).filter((c) => c.pdf !== false);
   if (!picked.length) picked = EXPORT_COLUMNS.filter((c) => c.pdf !== false);
+  await sendPdf(res, { match, picked, merge: parseMerge(req.query.merge), byUsername: flag(req.query.groupByUsername), filename: req.query.filename });
+};
+
+// A user's PDF of their own entries, under the same filters as My Entries. Which entries and columns it
+// holds is fixed here: nothing in the query can widen it.
+const exportMyPdf = async (req, res) => {
+  const userId = toObjectId(req.userId, "user");
+  const match = { ...myFilterMatch(req.query), userId, userDeletedAt: null };
+  const picked = EXPORT_COLUMNS.filter((c) => c.pdf !== false && c.key !== "user");
+  await sendPdf(res, { match, picked, byUsername: true, filename: req.query.filename });
+};
+
+// Streams a PDF report: summary cards, each backend username's totals, the overview panels, one section
+// per payment method with its subtotal, the grand total, then a page listing every image link in full
+// (the table itself only has small "Photo" / "Cashout" buttons)
+const sendPdf = async (res, { match, picked, merge = [], byUsername = false, filename }) => {
+  const [{ methods: stats, groups: groupStats, usernames }, overview] = await Promise.all([exportStats(match, merge), summaryTotals(match)]);
   // Row number first: the Image Links page refers back to it
   const columns = [{ key: "no", label: "#", width: 30, value: () => "" }, ...picked];
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${exportFilename(req.query.filename, "pdf")}"`);
+  res.setHeader("Content-Disposition", `attachment; filename="${exportFilename(filename, "pdf")}"`);
 
   const doc = new PDFDocument({
     size: "A4",
@@ -708,7 +770,45 @@ const exportPdf = async (req, res) => {
     doc.fillColor(PDF.muted).font("Helvetica-Bold").fontSize(7.5).text(label.toUpperCase(), cx + 12, y + 10, { width: cardW - 20, lineBreak: false });
     doc.fillColor(color).font("Helvetica-Bold").fontSize(15).text(value, cx + 12, y + 23, { width: cardW - 20, lineBreak: false, ellipsis: true });
   });
-  y += cardH + 10;
+  y += cardH + 14;
+
+  // ---- Backend username totals: what each name loaded and redeemed, right at the top ----
+  if (usernames.length) {
+    const numW = pageWidth * 0.17;
+    const nameCols = [
+      { label: "Backend Username", w: pageWidth - numW * 3 },
+      { label: "Entries", w: numW, align: "right" },
+      { label: "Points Loaded", w: numW, align: "right", color: "#2563eb" },
+      { label: "Points Redeemed", w: numW, align: "right", color: "#7c3aed" },
+    ];
+    const nameRow = (cells, { bold = false, color, size } = {}) => {
+      let x = left;
+      nameCols.forEach((c, i) => {
+        cellText(cells[i], x, c.w, { bold: bold || i > 1, color: color || c.color || PDF.ink, align: c.align, size: size || 9 });
+        x += c.w;
+      });
+      y += ROW_H;
+    };
+    const nameHeader = () => {
+      doc.rect(left, y, pageWidth, ROW_H).fill(PDF.head);
+      nameRow(nameCols.map((c) => c.label.toUpperCase()), { bold: true, color: "#ffffff", size: 7.5 });
+    };
+    doc.fillColor(PDF.ink).font("Helvetica-Bold").fontSize(11).text("Totals by Backend Username", left, y, { lineBreak: false });
+    y += 17;
+    onNewPage = nameHeader;
+    nameHeader();
+    usernames.forEach((u, i) => {
+      ensureRoom(ROW_H);
+      if (i % 2) doc.rect(left, y, pageWidth, ROW_H).fill(PDF.zebra);
+      nameRow([u.name || "(none)", u.count, points(u.loaded), points(u.redeemed)]);
+      rule(y);
+    });
+    ensureRoom(ROW_H);
+    doc.rect(left, y, pageWidth, ROW_H).fill(PDF.head);
+    nameRow(["Total", all.count, points(all.loaded), points(all.redeemed)], { bold: true, color: "#ffffff" });
+    onNewPage = () => {};
+    y += 16;
+  }
 
   // ---- Overview: the same four panels as the user's dashboard (each total split by method or game) ----
   const panels = [
@@ -717,6 +817,7 @@ const exportPdf = async (req, res) => {
     { title: "Total Redeemed", total: overview.totalRedeemed, color: "#7c3aed", rows: overview.redeemedByGame.map((r) => ({ label: r.game || "Unknown game", amount: r.amount })) },
     { title: "Total Cashout", total: overview.totalCashout, color: "#d97706", rows: overview.cashoutByMethod.map((r) => ({ label: methodTitle(r.method || ""), amount: r.amount, dot: METHOD_COLORS[r.method || ""] })) },
   ];
+  ensureRoom(140); // a long username table can leave too little of the page for the panels
   doc.fillColor(PDF.ink).font("Helvetica-Bold").fontSize(11).text("Overview", left, y, { lineBreak: false });
   y += 17;
   const PANEL_HEAD = 44;
@@ -1002,11 +1103,12 @@ const listEdits = async (req, res) => {
   if (req.query.userId) match.userId = toObjectId(req.query.userId, "userId");
   if (req.query.paymentId) match.paymentId = toObjectId(req.query.paymentId, "paymentId");
   const pg = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
+  const dir = parseOrder(req.query);
   await sendCached(req, res, { name: "admin-edits", deps: [deps.payments, deps.games] }, async () => {
     const [items, total] = await Promise.all([
       PaymentEdit.aggregate([
         { $match: match },
-        { $sort: { createdAt: -1, _id: -1 } },
+        { $sort: { createdAt: dir, _id: dir } },
         { $skip: pg.skip },
         { $limit: pg.limit },
         {
@@ -1040,11 +1142,12 @@ const listEdits = async (req, res) => {
 };
 
 const listAudit = async (req, res) => {
+  const dir = parseOrder(req.query);
   await sendCached(req, res, { name: "admin-audit", deps: [deps.audit, deps.users] }, async () => {
     const pg = parsePagination(req.query, { defaultLimit: 50, maxLimit: 100 });
     const [items, total] = await Promise.all([
       AuditLog.aggregate([
-        { $sort: { createdAt: -1 } },
+        { $sort: { createdAt: dir } },
         { $skip: pg.skip },
         { $limit: pg.limit },
         {
@@ -1092,5 +1195,6 @@ module.exports = {
   gameUsernames,
   exportCsv,
   exportPdf,
+  exportMyPdf,
   listAudit,
 };

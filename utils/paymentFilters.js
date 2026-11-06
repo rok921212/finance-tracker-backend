@@ -8,19 +8,35 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // "a,b,,a" -> ["a", "b"]: trimmed, de-duplicated, capped so a query can't grow unbounded
 const listParam = (v, max = 50) => [...new Set(String(v ?? "").split(",").map((s) => s.trim()).filter(Boolean))].slice(0, max);
 
+// { date } condition for ?dateFrom / ?dateTo (both optional, dateTo inclusive of the whole day)
+const dateRangeMatch = (query) => {
+  if (!query.dateFrom && !query.dateTo) return {};
+  const date = {};
+  if (query.dateFrom) date.$gte = parseDay(query.dateFrom, "dateFrom");
+  if (query.dateTo) date.$lt = new Date(parseDay(query.dateTo, "dateTo").getTime() + DAY_MS);
+  return { date };
+};
+
+// Condition for ?player: player names or payment tags starting with the text, ignoring case ("mike" matches
+// "Mike1714mw"). A tag's leading $ is optional, so "payme" and "$payme" both find "$payme".
+const playerMatch = (query) => {
+  const text = String(query.player ?? "").trim().slice(0, 60);
+  if (!text) return {};
+  const start = escapeRegex(text);
+  return {
+    $or: [
+      { player: { $regex: "^" + start, $options: "i" } },
+      { paymentTag: { $regex: "^\\$?" + start, $options: "i" } },
+    ],
+  };
+};
+
 /**
  * Builds a Payment $match from whitelisted query params.
  * Shared by the admin list, summaries and CSV export so they always agree.
  */
 const buildPaymentFilter = async (query) => {
-  const match = {};
-
-  if (query.dateFrom || query.dateTo) {
-    match.date = {};
-    if (query.dateFrom) match.date.$gte = parseDay(query.dateFrom, "dateFrom");
-    // dateTo is inclusive of the whole day
-    if (query.dateTo) match.date.$lt = new Date(parseDay(query.dateTo, "dateTo").getTime() + DAY_MS);
-  }
+  const match = { ...dateRangeMatch(query), ...playerMatch(query) };
 
   if (query.gameId) match.gameId = toObjectId(query.gameId, "gameId");
 
@@ -35,11 +51,6 @@ const buildPaymentFilter = async (query) => {
   const gameUsernames = listParam(query.gameUsername);
   if (gameUsernames.length) {
     match.gameUsername = { $in: gameUsernames.map((n) => new RegExp("^" + escapeRegex(n.slice(0, 60)) + "$", "i")) };
-  }
-
-  // Player name the entry was loaded under (prefix, case-insensitive)
-  if (query.player && String(query.player).trim()) {
-    match.player = { $regex: "^" + escapeRegex(String(query.player).trim().slice(0, 60)), $options: "i" };
   }
 
   if (query.userId) {
@@ -57,4 +68,4 @@ const buildPaymentFilter = async (query) => {
   return match;
 };
 
-module.exports = { buildPaymentFilter, listParam };
+module.exports = { buildPaymentFilter, dateRangeMatch, listParam, playerMatch };

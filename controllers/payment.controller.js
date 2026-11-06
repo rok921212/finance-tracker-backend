@@ -5,8 +5,9 @@ const Game = require("../models/game.model.js");
 const PaymentEdit = require("../models/paymentEdit.model.js");
 const cloud = require("../services/cloudinary.js");
 const { HttpError } = require("../utils/httpError.js");
-const { parseToCents, parseDay, toObjectId, parsePagination, pageResult, escapeRegex } = require("../utils/validation.js");
-const { sendCached, bump, deps } = require("../services/cache.js");
+const { parseToCents, parseDay, toObjectId, parsePagination, pageResult } = require("../utils/validation.js");
+const { dateRangeMatch, playerMatch } = require("../utils/paymentFilters.js");
+const { sendCached, bump, deps, formatVersions } = require("../services/cache.js");
 const { listProject, syncToken, sendChanges } = require("../utils/delta.js");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -228,23 +229,34 @@ const cleanupAssets = async (assets) => {
   }
 };
 
+// The same, without making the request wait for Cloudinary
+const cleanupLater = (assets) => {
+  cleanupAssets(assets).catch(() => {});
+};
+
+// Runs the uploads side by side. If one fails, the ones that worked are removed again.
+const storeAll = async (uploads) => {
+  const results = await Promise.allSettled(uploads);
+  const failed = results.find((r) => r.status === "rejected");
+  if (failed) {
+    await cleanupAssets(results.map((r) => r.value && r.value.created));
+    throw failed.reason;
+  }
+  return results.map((r) => r.value);
+};
+
 const createPayment = async (req, res) => {
   const userId = toObjectId(req.userId, "user");
   const entry = parseEntry(req.body);
   const cashoutFile = req.cashoutProofFile; // optional
-  entry.gameId = await resolveGame(req.body);
-
   // The payment screenshot is optional
   const hash = req.file ? hashOf(req.file.buffer) : null;
-  if (hash) await assertNotDuplicate(userId, hash, req.body.allowDuplicate);
+  [entry.gameId] = await Promise.all([resolveGame(req.body), hash && assertNotDuplicate(userId, hash, req.body.allowDuplicate)]);
 
-  const created = [];
+  const [shot, proof] = await storeAll([hash && storeScreenshot(req.file, hash), cashoutFile && storeCashoutProof(cashoutFile)]);
+  const created = [shot && shot.created, proof && proof.created];
   let payment;
   try {
-    const shot = hash ? await storeScreenshot(req.file, hash) : null;
-    if (shot) created.push(shot.created);
-    const proof = cashoutFile ? await storeCashoutProof(cashoutFile) : null;
-    if (proof) created.push(proof.created);
     payment = await Payment.create({
       userId,
       ...splitEmpty(entry).set,
@@ -256,8 +268,10 @@ const createPayment = async (req, res) => {
     throw err;
   }
 
-  await bump(deps.payments, deps.userPayments(userId));
-  res.status(201).json({ message: "Entry submitted", payment: { id: payment._id } });
+  // The finished row goes back with the response, so the client adds just this row to its list
+  const [versions, row] = await Promise.all([bump(deps.payments, deps.userPayments(userId)), myPaymentDetail(userId, payment._id)]);
+  res.set("X-Data-Versions", formatVersions(versions));
+  res.status(201).json({ message: "Entry submitted", payment: row });
 };
 
 const myPaymentDetail = async (userId, id) => {
@@ -321,17 +335,14 @@ const updatePayment = async (req, res) => {
 
   const { set, unset } = splitEmpty(entry);
   const changes = await diffEntry(current, entry);
-  const created = [];
+  const [shot, proof] = await storeAll([replaceShot && storeScreenshot(req.file, newHash), cashoutFile && storeCashoutProof(cashoutFile)]);
+  const created = [shot && shot.created, proof && proof.created];
   try {
-    if (replaceShot) {
-      const shot = await storeScreenshot(req.file, newHash);
-      created.push(shot.created);
+    if (shot) {
       Object.assign(set, { screenshot: shot.value, screenshotHash: newHash });
       changes.push({ field: "screenshot", from: null, to: current.screenshot ? "replaced" : "added" });
     }
-    if (cashoutFile) {
-      const proof = await storeCashoutProof(cashoutFile);
-      created.push(proof.created);
+    if (proof) {
       Object.assign(set, { cashoutProof: proof.value, cashoutProofHash: proof.hash });
       const oldProofId = current.cashoutProof && current.cashoutProof.publicId;
       if (proof.value.publicId !== oldProofId) {
@@ -355,10 +366,11 @@ const updatePayment = async (req, res) => {
   if (oldProof && set.cashoutProof && set.cashoutProof.publicId !== oldProof) {
     dropped.push({ publicId: oldProof, field: "cashoutProof" });
   }
-  await cleanupAssets(dropped);
+  cleanupLater(dropped);
 
-  await bump(deps.payments, deps.userPayments(userId));
-  res.json({ message: "Entry updated", payment: await myPaymentDetail(userId, id) });
+  const [versions, row] = await Promise.all([bump(deps.payments, deps.userPayments(userId)), myPaymentDetail(userId, id)]);
+  res.set("X-Data-Versions", formatVersions(versions));
+  res.json({ message: "Entry updated", payment: row });
 };
 
 const MY_SORTS = ["date", "deposit", "loaded", "redeemed", "cashout", "player", "gameUsername", "paymentMethod"];
@@ -367,11 +379,8 @@ const TEXT_SORTS = ["player", "gameUsername", "paymentMethod"];
 // Player names compare case-insensitively (sort order and filter)
 const CASE_INSENSITIVE = { locale: "en", strength: 2 };
 
-// Optional player filter: the exact name, ignoring case ("Superman" matches "superman", "superman2" does not)
-const myPlayerMatch = (query) => {
-  const player = String(query.player ?? "").trim().slice(0, 60);
-  return player ? { player: { $regex: "^" + escapeRegex(player) + "$", $options: "i" } } : {};
-};
+// Optional filters, combined: player name (start of the name, any case) and date range
+const myFilterMatch = (query) => ({ ...playerMatch(query), ...dateRangeMatch(query) });
 
 // ?sort=deposit|loaded|redeemed|cashout|player|gameUsername|paymentMethod|date &order=asc|desc (default: newest first; text A-Z)
 const myListOptions = (query) => {
@@ -388,7 +397,7 @@ const myListOptions = (query) => {
 const listMyPayments = async (req, res) => {
   const userId = toObjectId(req.userId, "user");
   const pg = parsePagination(req.query, { defaultLimit: 20, maxLimit: 50 });
-  const match = { userId, userDeletedAt: null, ...myPlayerMatch(req.query) };
+  const match = { userId, userDeletedAt: null, ...myFilterMatch(req.query) };
   const { $sort, collation } = myListOptions(req.query);
 
   await sendCached(
@@ -499,7 +508,7 @@ const mySummary = async (req, res) => {
   const userId = toObjectId(req.userId, "user");
   const opts = { name: "my-summary", deps: [deps.userPayments(userId)], scope: String(userId) };
   await sendCached(req, res, opts, () =>
-    summaryTotals({ userId, userDeletedAt: null, ...myPlayerMatch(req.query) })
+    summaryTotals({ userId, userDeletedAt: null, ...myFilterMatch(req.query) })
   );
 };
 
@@ -537,6 +546,7 @@ const myGameUsernames = async (req, res) => {
 };
 
 module.exports = {
+  cleanupLater,
   createPayment,
   updatePayment,
   myGameUsernames,
@@ -548,5 +558,6 @@ module.exports = {
   toListItem,
   gameLookup,
   summaryTotals,
+  myFilterMatch,
   cleanupAssets,
 };

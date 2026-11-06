@@ -41,6 +41,12 @@ const parsePagination = (query, { defaultLimit = 20, maxLimit = 50 } = {}) => {
   return { page, limit, skip: (page - 1) * limit };
 };
 
+// ?order=asc|desc as a Mongo sort direction (default: newest first)
+const parseOrder = (query) => {
+  if (query.order && !["asc", "desc"].includes(query.order)) throw new HttpError(400, "Invalid order", "INVALID_ORDER");
+  return query.order === "asc" ? 1 : -1;
+};
+
 const pageResult = (items, total, { page, limit }) => ({
   items,
   total,
@@ -48,4 +54,4 @@ const pageResult = (items, total, { page, limit }) => ({
   pages: Math.max(1, Math.ceil(total / limit)),
 });
 
-module.exports = { parseToCents, parseDay, toObjectId, escapeRegex, parsePagination, pageResult };
+module.exports = { parseToCents, parseDay, toObjectId, escapeRegex, parsePagination, parseOrder, pageResult };

@@ -20,6 +20,7 @@ jest.mock("../services/cloudinary.js", () => {
   };
 });
 
+const zlib = require("zlib");
 const mongoose = require("mongoose");
 const request = require("supertest");
 const bcrypt = require("bcryptjs");
@@ -1191,7 +1192,22 @@ describe("editing entries", () => {
     expect((await edit(userA.token, id, { ...base, cashout: "5", cashoutMethod: "chime" }, null, png2)).status).toBe(200);
     doc = await Payment.findById(id).lean();
     expect(doc.cashoutProof.publicId).not.toBe(first);
+    // Cleanup runs after the response
+    for (let i = 0; i < 50 && !cloud.destroy.mock.calls.length; i++) await new Promise((r) => setTimeout(r, 10));
     expect(cloud.destroy).toHaveBeenCalledWith(first);
+  });
+
+  test("a saved entry comes back as a finished list row with the data versions", async () => {
+    const res = await submit(userA.token, { date: "2026-09-21", deposit: "3", loaded: "3", player: "Row Back", gameId: fireKirin._id }, null);
+    expect(res.status).toBe(201);
+    expect(res.body.payment).toMatchObject({ player: "Row Back", deposit: 300, game: "Fire Kirin" });
+    expect(res.headers["x-data-versions"]).toContain(`payments:u:${userA.id}=`);
+
+    const list = await request(app).get("/api/payments?limit=50&sort=date").set(auth(userA.token));
+    const row = list.body.items.find((i) => i.id === res.body.payment.id);
+    expect(res.body.payment.date).toBe(row.date);
+    expect(list.headers["x-cache-versions"]).toContain(res.headers["x-data-versions"].split(",")[1]);
+    await request(app).delete(`/api/admin/payments/${row.id}`).set(auth(adminTok));
   });
 
   test("image changes are logged; a no-op edit logs nothing", async () => {
@@ -1414,21 +1430,63 @@ describe("user list sorting and player filter", () => {
     expect(methods(await list("sort=paymentMethod&order=desc"))).toEqual(["zelle", "venmo", "chime", "cashapp"]);
   });
 
-  test("player filter matches the exact name in any case, not longer names", async () => {
+  test("player filter matches the start of the name in any case", async () => {
     const res = await list("player=superman&sort=deposit");
     expect(res.status).toBe(200);
-    expect(res.body.total).toBe(2);
-    expect(players(res)).toEqual(["SUPERMAN", "Superman"]);
+    expect(res.body.total).toBe(3);
+    expect(players(res)).toEqual(["SUPERMAN", "superman2", "Superman"]);
+    // Only the start of the name counts
+    expect((await list("player=uperman")).body.total).toBe(0);
     // Regex characters are taken literally
     expect((await list("player=super.*")).body.total).toBe(0);
+  });
+
+  test("player filter also finds payment tags, on the list, summary and admin list", async () => {
+    const tagged = await register("taguser");
+    const add = (player, paymentTag, deposit) =>
+      submit(tagged.token, { date: "2026-09-12", loaded: "1", gameId: juwa._id, player, paymentTag, deposit }, null);
+    for (const row of [["alpha", "$PayMe", "10"], ["beta", "$other", "20"], ["payday", "$third", "40"]]) {
+      expect((await add(...row)).status).toBe(201);
+    }
+    const get = (path, query) => request(app).get(`/api/payments${path}?${query}`).set(auth(tagged.token));
+    const names = (res) => res.body.items.map((i) => i.player).sort();
+
+    // The tag's $ is optional, case doesn't matter, and player names still match
+    expect(names(await get("", "player=payme"))).toEqual(["alpha"]);
+    expect(names(await get("", `player=${encodeURIComponent("$payme")}`))).toEqual(["alpha"]);
+    expect(names(await get("", "player=pay"))).toEqual(["alpha", "payday"]);
+    // Only the start of the tag counts, and regex characters are literal
+    expect((await get("", "player=ayme")).body.total).toBe(0);
+    expect((await get("", "player=p.yme")).body.total).toBe(0);
+    expect((await get("/summary", "player=pay")).body.totalDeposit).toBe(5000);
+
+    const admin = await request(app).get(`/api/admin/payments?userId=${tagged.id}&player=payme`).set(auth(adminTok));
+    expect(admin.body.items.map((i) => i.player)).toEqual(["alpha"]);
   });
 
   test("summary follows the player filter", async () => {
     const all = await request(app).get("/api/payments/summary").set(auth(sorter.token));
     const sup = await request(app).get("/api/payments/summary?player=SuperMan").set(auth(sorter.token));
     expect(all.body.totalDeposit).toBe(6500);
-    expect(sup.body.totalDeposit).toBe(4000);
-    expect(sup.body.totalRedeemed).toBe(500);
+    expect(sup.body.totalDeposit).toBe(6000);
+    expect(sup.body.totalRedeemed).toBe(1400);
+  });
+
+  test("player and date filters combine on the list and the summary", async () => {
+    const dated = await register("datefilteruser");
+    for (const [player, date, deposit] of [["mike", "2026-09-10", "10"], ["Mike1714mw", "2026-09-20", "20"], ["bob", "2026-09-20", "40"]]) {
+      expect((await submit(dated.token, { date, player, deposit, loaded: "1", gameId: juwa._id }, null)).status).toBe(201);
+    }
+    const get = (path, query) => request(app).get(`/api/payments${path}?${query}`).set(auth(dated.token));
+    const names = (res) => res.body.items.map((i) => i.player).sort();
+
+    expect(names(await get("", "player=mike"))).toEqual(["Mike1714mw", "mike"]);
+    expect(names(await get("", "player=mike&dateFrom=2026-09-20&dateTo=2026-09-20"))).toEqual(["Mike1714mw"]);
+    expect(names(await get("", "player=mike&dateTo=2026-09-10"))).toEqual(["mike"]);
+    expect(names(await get("", "dateFrom=2026-09-20"))).toEqual(["Mike1714mw", "bob"]);
+    expect((await get("", "player=bob&dateTo=2026-09-10")).body.total).toBe(0);
+    expect((await get("/summary", "player=mike&dateFrom=2026-09-20")).body.totalDeposit).toBe(2000);
+    expect((await get("", "dateFrom=nope")).status).toBe(400);
   });
 
   test("admin totals include redeemed", async () => {
@@ -1445,6 +1503,84 @@ describe("user list sorting and player filter", () => {
   test("rejects unknown sort fields and orders", async () => {
     expect((await list("sort=password")).status).toBe(400);
     expect((await list("sort=deposit&order=sideways")).status).toBe(400);
+  });
+});
+
+describe("admin date sorting", () => {
+  let dated;
+  const admin = (path) => request(app).get(`/api/admin/${path}`).set(auth(adminTok));
+  const days = (res) => res.body.items.map((i) => i.date.slice(0, 10));
+  const OLD_AUDIT = "date-sort-test";
+
+  beforeAll(async () => {
+    await Game.updateOne({ _id: juwa._id }, { $set: { active: true } });
+    dated = await register("adminsortuser");
+    for (const date of ["2026-03-02", "2026-03-03", "2026-03-01"]) {
+      expect((await submit(dated.token, { date, deposit: "1", loaded: "1", gameId: juwa._id }, null)).status).toBe(201);
+    }
+  });
+  afterAll(async () => {
+    await Game.updateOne({ _id: juwa._id }, { $set: { active: false } });
+    await AuditLog.deleteMany({ action: OLD_AUDIT });
+  });
+
+  test("payments are newest first by default and reverse with order=asc", async () => {
+    const q = `payments?userId=${dated.id}`;
+    expect(days(await admin(q))).toEqual(["2026-03-03", "2026-03-02", "2026-03-01"]);
+    expect(days(await admin(`${q}&order=desc`))).toEqual(["2026-03-03", "2026-03-02", "2026-03-01"]);
+    expect(days(await admin(`${q}&order=asc`))).toEqual(["2026-03-01", "2026-03-02", "2026-03-03"]);
+  });
+
+  test("order=asc works with filters and carries across pages", async () => {
+    const q = `payments?userId=${dated.id}&order=asc`;
+    expect(days(await admin(`${q}&dateFrom=2026-03-02`))).toEqual(["2026-03-02", "2026-03-03"]);
+    expect(days(await admin(`${q}&limit=2&page=1`))).toEqual(["2026-03-01", "2026-03-02"]);
+    expect(days(await admin(`${q}&limit=2&page=2`))).toEqual(["2026-03-03"]);
+  });
+
+  test("edit history sorts by when the edit was made", async () => {
+    const paymentId = new mongoose.Types.ObjectId();
+    const at = ["2026-02-02", "2026-02-03", "2026-02-01"];
+    await PaymentEdit.collection.insertMany(
+      at.map((d) => ({ paymentId, userId: new mongoose.Types.ObjectId(dated.id), changes: [], createdAt: new Date(d) }))
+    );
+    const edits = (res) => res.body.items.map((i) => i.createdAt.slice(0, 10));
+    expect(edits(await admin(`edits?paymentId=${paymentId}`))).toEqual(["2026-02-03", "2026-02-02", "2026-02-01"]);
+    expect(edits(await admin(`edits?paymentId=${paymentId}&order=asc`))).toEqual(["2026-02-01", "2026-02-02", "2026-02-03"]);
+  });
+
+  test("audit log sorts by time in both directions", async () => {
+    const base = { adminId: new mongoose.Types.ObjectId(), action: OLD_AUDIT, targetType: "payment", targetId: new mongoose.Types.ObjectId() };
+    await AuditLog.collection.insertMany([
+      { ...base, createdAt: new Date("2001-01-02") },
+      { ...base, createdAt: new Date("2001-01-01") },
+    ]);
+    const times = (res) => res.body.items.map((i) => i.createdAt);
+    const oldest = times(await admin("audit?limit=99&order=asc"));
+    expect(oldest.slice(0, 2).map((t) => t.slice(0, 10))).toEqual(["2001-01-01", "2001-01-02"]);
+    expect(oldest).toEqual([...oldest].sort());
+    const newest = times(await admin("audit?limit=99"));
+    expect(newest).toEqual([...newest].sort().reverse());
+  });
+
+  test("users stay A-Z by default and sort by join date on request", async () => {
+    const joined = { datesorta: "2003-01-01", datesortb: "2001-01-01", datesortc: "2002-01-01" };
+    for (const [username, date] of Object.entries(joined)) {
+      const u = await register(username);
+      await User.updateOne({ _id: u.id }, { $set: { createdAt: new Date(date) } });
+    }
+    const names = (res) => res.body.items.map((i) => i.username);
+    expect(names(await admin("users?search=datesort"))).toEqual(["datesorta", "datesortb", "datesortc"]);
+    expect(names(await admin("users?search=datesort&sort=createdAt"))).toEqual(["datesorta", "datesortc", "datesortb"]);
+    expect(names(await admin("users?search=datesort&sort=createdAt&order=asc"))).toEqual(["datesortb", "datesortc", "datesorta"]);
+    await User.deleteMany({ username: { $in: Object.keys(joined) } });
+  });
+
+  test("rejects an unknown order or sort", async () => {
+    for (const path of ["payments", "edits", "audit", "users"]) {
+      expect((await admin(`${path}?order=sideways`)).status).toBe(400);
+    }
+    expect((await admin("users?sort=password")).status).toBe(400);
   });
 });
 
@@ -1690,6 +1826,164 @@ describe("export merging and grouping by backend username", () => {
     expect((await request(app).get(`${base}&merge=${encodeURIComponent('[{"name":"","members":[]}]')}`).set(auth(adminTok))).status).toBe(400);
 
     for (const id of ids) await request(app).delete(`/api/admin/payments/${id}`).set(auth(adminTok));
+  });
+});
+
+describe("PDF exclusions", () => {
+  // Text of a pdfkit file: inflate each stream, then decode the hex strings of its text operators
+  const pdfText = (buf) => {
+    let text = "";
+    for (const m of buf.toString("latin1").matchAll(/\nstream\n([\s\S]*?)\nendstream/g)) {
+      const body = zlib.inflateSync(Buffer.from(m[1], "latin1")).toString("latin1");
+      for (const line of body.matchAll(/\[(.*?)\] TJ/g)) {
+        text += [...line[1].matchAll(/<([0-9a-fA-F]+)>/g)].map((h) => Buffer.from(h[1], "hex").toString("latin1")).join("") + "\n";
+      }
+    }
+    return text;
+  };
+
+  test("leaves out a backend username on chosen payment methods, or on all of them", async () => {
+    const entries = [
+      { gameUsername: "excljohn", paymentMethod: "cashapp", deposit: "11" },
+      { gameUsername: "ExclJohn", paymentMethod: "venmo", deposit: "22" },
+      { gameUsername: "exclamy", paymentMethod: "cashapp", deposit: "33" },
+      { gameUsername: "exclgone", paymentMethod: "venmo", deposit: "44" },
+      { gameUsername: "exclgone", paymentMethod: "zelle", deposit: "66" },
+    ];
+    const ids = [];
+    for (const [i, e] of entries.entries()) {
+      const r = await submit(userA.token, { date: "2026-09-27", loaded: "5", gameId: fireKirin._id, ...e }, avif(9900 + i));
+      expect([r.status, r.body.code]).toEqual([201, undefined]);
+      ids.push(r.body.payment.id);
+    }
+    const base = "/api/admin/payments/export.pdf?gameUsername=excljohn,exclamy,exclgone";
+    const pdf = async (query) => {
+      const res = await request(app).get(`${base}${query}`).set(auth(adminTok)).responseType("blob");
+      expect(res.status).toBe(200);
+      return pdfText(res.body);
+    };
+
+    const all = await pdf("");
+    for (const amount of ["$11.00", "$22.00", "$33.00", "$44.00", "$66.00", "$176.00"]) expect(all).toContain(amount);
+
+    // One method for one name (any case), and every method for another
+    const exclude = encodeURIComponent(JSON.stringify([{ name: "EXCLJOHN", methods: ["cashapp"] }, { name: "exclgone" }]));
+    const some = await pdf(`&exclude=${exclude}`);
+    for (const amount of ["$22.00", "$33.00", "$55.00"]) expect(some).toContain(amount);
+    for (const amount of ["$11.00", "$44.00", "$66.00", "$176.00"]) expect(some).not.toContain(amount);
+
+    // Leaving everything out still gives a valid report
+    const everything = encodeURIComponent(JSON.stringify(["excljohn", "exclamy", "exclgone"].map((name) => ({ name }))));
+    expect(await pdf(`&exclude=${everything}`)).toContain("No entries match these filters.");
+
+    // Regex characters in a name are literal
+    expect(await pdf(`&exclude=${encodeURIComponent('[{"name":"excl.*"}]')}`)).toContain("$176.00");
+
+    const status = async (value) => (await request(app).get(`${base}&exclude=${encodeURIComponent(value)}`).set(auth(adminTok))).status;
+    expect(await status("not-json")).toBe(400);
+    expect(await status('{"name":"a"}')).toBe(400);
+    expect(await status('[{"name":""}]')).toBe(400);
+    expect(await status('[{"name":"a","methods":["bitcoin"]}]')).toBe(400);
+    expect(await status('[{"name":"a","methods":"cashapp"}]')).toBe(400);
+
+    for (const id of ids) await request(app).delete(`/api/admin/payments/${id}`).set(auth(adminTok));
+  });
+
+  // The rows of the "Totals by Backend Username" table, as lowercase [name, entries, loaded, redeemed]
+  const nameTotals = (text) => {
+    const cells = text.slice(text.indexOf("Totals by Backend Username"), text.indexOf("Overview")).toLowerCase().trim().split("\n").slice(5);
+    return Array.from({ length: cells.length / 4 }, (_, i) => cells.slice(i * 4, i * 4 + 4));
+  };
+
+  test("admin report totals each backend username at the top, following merges and exclusions", async () => {
+    const entries = [
+      { gameUsername: "totjohn", paymentMethod: "cashapp", loaded: "10", redeemed: "1" },
+      { gameUsername: "TotJohn", paymentMethod: "venmo", loaded: "20", redeemed: "2" },
+      { gameUsername: "totamy", paymentMethod: "venmo", loaded: "5", redeemed: "0" },
+    ];
+    const ids = [];
+    for (const [i, e] of entries.entries()) {
+      const r = await submit(userA.token, { date: "2026-09-28", deposit: "1", gameId: fireKirin._id, ...e }, avif(9920 + i));
+      expect([r.status, r.body.code]).toEqual([201, undefined]);
+      ids.push(r.body.payment.id);
+    }
+    const pdf = async (query = "") => {
+      const res = await request(app).get(`/api/admin/payments/export.pdf?gameUsername=totjohn,totamy${query}`).set(auth(adminTok)).responseType("blob");
+      expect(res.status).toBe(200);
+      return pdfText(res.body);
+    };
+
+    const text = await pdf();
+    // Before the overview panels and every table
+    expect(text.indexOf("Totals by Backend Username")).toBeLessThan(text.indexOf("Overview"));
+    // Case variants are one name, summed across payment methods
+    expect(nameTotals(text)).toEqual([
+      ["totamy", "1", "5.00", "0.00"],
+      ["totjohn", "2", "30.00", "3.00"],
+      ["total", "3", "35.00", "3.00"],
+    ]);
+
+    const merge = encodeURIComponent(JSON.stringify([{ name: "Team", members: ["totjohn", "totamy"] }]));
+    expect(nameTotals(await pdf(`&merge=${merge}`))).toEqual([
+      ["team", "3", "35.00", "3.00"],
+      ["total", "3", "35.00", "3.00"],
+    ]);
+
+    const exclude = encodeURIComponent(JSON.stringify([{ name: "totjohn", methods: ["cashapp"] }]));
+    expect(nameTotals(await pdf(`&exclude=${exclude}`))).toEqual([
+      ["totamy", "1", "5.00", "0.00"],
+      ["totjohn", "1", "20.00", "2.00"],
+      ["total", "2", "25.00", "2.00"],
+    ]);
+
+    for (const id of ids) await request(app).delete(`/api/admin/payments/${id}`).set(auth(adminTok));
+  });
+
+  test("a user's PDF holds only their own visible entries, whatever the query asks for", async () => {
+    const owner = await register("pdfowner");
+    const other = await register("pdfother");
+    const add = (tok, date, gameUsername, loaded, redeemed, i, player = "Player One") =>
+      submit(tok, { date, deposit: "1", gameId: fireKirin._id, paymentMethod: "cashapp", gameUsername, loaded, redeemed, player }, avif(9940 + i));
+    await add(owner.token, "2026-10-01", "ownname", "7", "2", 0, "alpha");
+    await add(owner.token, "2026-10-05", "ownname", "3", "0", 1, "beta");
+    await add(owner.token, "2026-10-05", "ownsecond", "4", "1", 2, "beta");
+    const hidden = await add(owner.token, "2026-10-05", "ownhidden", "50", "0", 3);
+    await add(other.token, "2026-10-05", "othername", "60", "0", 4);
+    expect((await request(app).delete(`/api/payments/${hidden.body.payment.id}`).set(auth(owner.token))).status).toBe(200);
+
+    const pdf = async (query = "") => {
+      const res = await request(app).get(`/api/payments/export.pdf${query}`).set(auth(owner.token)).responseType("blob");
+      expect([res.status, res.headers["content-type"]]).toEqual([200, "application/pdf"]);
+      return pdfText(res.body);
+    };
+
+    const text = await pdf();
+    expect(nameTotals(text)).toEqual([
+      ["ownname", "2", "10.00", "2.00"],
+      ["ownsecond", "1", "4.00", "1.00"],
+      ["total", "3", "14.00", "3.00"],
+    ]);
+    for (const secret of ["othername", "ownhidden", "pdfowner", "pdfother"]) expect(text).not.toContain(secret);
+    expect(text.split("\n")).not.toContain("USER");
+
+    // My Entries filters apply
+    expect(nameTotals(await pdf("?dateTo=2026-10-01"))).toEqual([
+      ["ownname", "1", "7.00", "2.00"],
+      ["total", "1", "7.00", "2.00"],
+    ]);
+    expect(nameTotals(await pdf("?player=beta"))).toEqual([
+      ["ownname", "1", "3.00", "0.00"],
+      ["ownsecond", "1", "4.00", "1.00"],
+      ["total", "2", "7.00", "1.00"],
+    ]);
+
+    // Admin-only params change nothing
+    const wide = await pdf(`?userId=${other.id}&gameUsername=othername&columns=user&exclude=not-json&merge=not-json`);
+    expect(nameTotals(wide)).toEqual(nameTotals(text));
+    expect(wide).not.toContain("othername");
+    expect(wide.split("\n")).not.toContain("USER");
+
+    expect((await request(app).get("/api/payments/export.pdf")).status).toBe(401);
   });
 });
 
